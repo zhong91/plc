@@ -114,6 +114,10 @@ StmtPtr Parser::parseStmt() {
         return std::make_shared<ReturnStmt>(value);
     }
 
+    if (match(TokenType::KwIf)) {
+    return parseIfStmt();
+}
+
     if (match(TokenType::KwConst)) {
         return parseVarDeclStmt(true);
     }
@@ -133,6 +137,27 @@ StmtPtr Parser::parseStmt() {
     ExprPtr expr = parseExpr();
     consume(TokenType::Semicolon, "Expected ';' after expression statement.");
     return std::make_shared<ExprStmt>(expr);
+}
+
+StmtPtr Parser::parseIfStmt() {
+    consume(TokenType::LParen, "Expected '(' after if.");
+
+    ExprPtr condition = parseExpr();
+
+    consume(TokenType::RParen, "Expected ')' after if condition.");
+
+    StmtPtr thenBranch = parseStmt();
+
+    StmtPtr elseBranch = nullptr;
+    if (match(TokenType::KwElse)) {
+        elseBranch = parseStmt();
+    }
+
+    return std::make_shared<IfStmt>(
+        condition,
+        thenBranch,
+        elseBranch
+    );
 }
 
 StmtPtr Parser::parseVarDeclStmt(bool isConst) {

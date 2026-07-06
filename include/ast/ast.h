@@ -17,6 +17,7 @@ enum class ASTNodeType {
     EmptyStmt,
     VarDeclStmt,
     AssignStmt,
+    IfStmt,
 
     BinaryExpr,
     UnaryExpr,
@@ -145,6 +146,19 @@ public:
         : Stmt(ASTNodeType::AssignStmt),
           name(std::move(name)),
           value(std::move(value)) {}
+};
+
+class IfStmt : public Stmt {
+public:
+    ExprPtr condition;
+    StmtPtr thenBranch;
+    StmtPtr elseBranch;
+
+    IfStmt(ExprPtr condition, StmtPtr thenBranch, StmtPtr elseBranch)
+        : Stmt(ASTNodeType::IfStmt),
+          condition(std::move(condition)),
+          thenBranch(std::move(thenBranch)),
+          elseBranch(std::move(elseBranch)) {}
 };
 
 class NumberLiteral : public Expr {
