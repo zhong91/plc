@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 
+#include "ast/ast_printer.h"
 #include "common/token.h"
 #include "parser/parser.h"
 
@@ -42,6 +43,7 @@ int main() {
 
     toycc::Parser parser(tokens);
     toycc::ASTNodePtr ast = parser.parse();
+    toycc::ASTPrinter::print(ast, std::cerr);
 
     if (ast != nullptr) {
         std::cerr << "Parser parsed global declarations successfully.\n";

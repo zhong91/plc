@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(compiler
     src/main.cpp
     src/parser/parser.cpp
+    src/ast/ast_printer.cpp
 )
 
 target_include_directories(compiler PRIVATE
