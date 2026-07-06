@@ -91,6 +91,64 @@ StmtPtr Parser::parseStmt() {
 }
 
 ExprPtr Parser::parseExpr() {
+    return parseAddExpr();
+}
+
+ExprPtr Parser::parseAddExpr() {
+    ExprPtr expr = parseMulExpr();
+
+    while (true) {
+        if (match(TokenType::Plus)) {
+            ExprPtr right = parseMulExpr();
+            expr = std::make_shared<BinaryExpr>("+", expr, right);
+        } else if (match(TokenType::Minus)) {
+            ExprPtr right = parseMulExpr();
+            expr = std::make_shared<BinaryExpr>("-", expr, right);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+ExprPtr Parser::parseMulExpr() {
+    ExprPtr expr = parseUnaryExpr();
+
+    while (true) {
+        if (match(TokenType::Star)) {
+            ExprPtr right = parseUnaryExpr();
+            expr = std::make_shared<BinaryExpr>("*", expr, right);
+        } else if (match(TokenType::Slash)) {
+            ExprPtr right = parseUnaryExpr();
+            expr = std::make_shared<BinaryExpr>("/", expr, right);
+        } else if (match(TokenType::Percent)) {
+            ExprPtr right = parseUnaryExpr();
+            expr = std::make_shared<BinaryExpr>("%", expr, right);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+ExprPtr Parser::parseUnaryExpr() {
+    if (match(TokenType::Plus)) {
+        ExprPtr operand = parseUnaryExpr();
+        return std::make_shared<UnaryExpr>("+", operand);
+    }
+
+    if (match(TokenType::Minus)) {
+        ExprPtr operand = parseUnaryExpr();
+        return std::make_shared<UnaryExpr>("-", operand);
+    }
+
+    if (match(TokenType::LogicalNot)) {
+        ExprPtr operand = parseUnaryExpr();
+        return std::make_shared<UnaryExpr>("!", operand);
+    }
+
     return parsePrimaryExpr();
 }
 

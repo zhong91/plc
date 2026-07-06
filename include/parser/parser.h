@@ -25,7 +25,11 @@ private:
     ValueType parseType();
     std::shared_ptr<Block> parseBlock();
     StmtPtr parseStmt();
+
     ExprPtr parseExpr();
+    ExprPtr parseAddExpr();
+    ExprPtr parseMulExpr();
+    ExprPtr parseUnaryExpr();
     ExprPtr parsePrimaryExpr();
 
     const Token& peek() const;
