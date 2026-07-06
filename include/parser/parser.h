@@ -29,6 +29,8 @@ private:
 
     std::shared_ptr<Block> parseBlock();
     StmtPtr parseStmt();
+    StmtPtr parseVarDeclStmt(bool isConst);
+    StmtPtr parseAssignStmt();
 
     ExprPtr parseExpr();
     ExprPtr parseLOrExpr();
@@ -46,6 +48,7 @@ private:
 
     bool isAtEnd() const;
     bool check(TokenType type) const;
+    bool checkNext(TokenType type) const;
     bool match(TokenType type);
 
     const Token& advance();

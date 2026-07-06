@@ -98,6 +98,10 @@ std::shared_ptr<Block> Parser::parseBlock() {
 }
 
 StmtPtr Parser::parseStmt() {
+    if (match(TokenType::Semicolon)) {
+        return std::make_shared<EmptyStmt>();
+    }
+
     if (match(TokenType::KwReturn)) {
         ExprPtr value = nullptr;
 
@@ -110,11 +114,58 @@ StmtPtr Parser::parseStmt() {
         return std::make_shared<ReturnStmt>(value);
     }
 
+    if (match(TokenType::KwConst)) {
+        return parseVarDeclStmt(true);
+    }
+
+    if (check(TokenType::KwInt)) {
+        return parseVarDeclStmt(false);
+    }
+
     if (check(TokenType::LBrace)) {
         return parseBlock();
     }
 
-    throw std::runtime_error("Unsupported statement.");
+    if (check(TokenType::Identifier) && checkNext(TokenType::Assign)) {
+        return parseAssignStmt();
+    }
+
+    ExprPtr expr = parseExpr();
+    consume(TokenType::Semicolon, "Expected ';' after expression statement.");
+    return std::make_shared<ExprStmt>(expr);
+}
+
+StmtPtr Parser::parseVarDeclStmt(bool isConst) {
+    consume(TokenType::KwInt, "Expected 'int' in variable declaration.");
+
+    Token nameToken = consume(TokenType::Identifier, "Expected variable name.");
+
+    consume(TokenType::Assign, "Expected '=' in variable declaration.");
+
+    ExprPtr init = parseExpr();
+
+    consume(TokenType::Semicolon, "Expected ';' after variable declaration.");
+
+    return std::make_shared<VarDeclStmt>(
+        isConst,
+        nameToken.lexeme,
+        init
+    );
+}
+
+StmtPtr Parser::parseAssignStmt() {
+    Token nameToken = consume(TokenType::Identifier, "Expected variable name.");
+
+    consume(TokenType::Assign, "Expected '=' in assignment statement.");
+
+    ExprPtr value = parseExpr();
+
+    consume(TokenType::Semicolon, "Expected ';' after assignment statement.");
+
+    return std::make_shared<AssignStmt>(
+        nameToken.lexeme,
+        value
+    );
 }
 
 ExprPtr Parser::parseExpr() {
@@ -294,6 +345,14 @@ bool Parser::check(TokenType type) const {
     }
 
     return peek().type == type;
+}
+
+bool Parser::checkNext(TokenType type) const {
+    if (current + 1 >= tokens.size()) {
+        return false;
+    }
+
+    return tokens[current + 1].type == type;
 }
 
 bool Parser::match(TokenType type) {

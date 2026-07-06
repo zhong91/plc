@@ -15,6 +15,8 @@ enum class ASTNodeType {
     ReturnStmt,
     ExprStmt,
     EmptyStmt,
+    VarDeclStmt,
+    AssignStmt,
 
     BinaryExpr,
     UnaryExpr,
@@ -105,6 +107,44 @@ public:
 
     explicit ReturnStmt(ExprPtr value)
         : Stmt(ASTNodeType::ReturnStmt), value(std::move(value)) {}
+};
+
+class ExprStmt : public Stmt {
+public:
+    ExprPtr expr;
+
+    explicit ExprStmt(ExprPtr expr)
+        : Stmt(ASTNodeType::ExprStmt), expr(std::move(expr)) {}
+};
+
+class EmptyStmt : public Stmt {
+public:
+    EmptyStmt()
+        : Stmt(ASTNodeType::EmptyStmt) {}
+};
+
+class VarDeclStmt : public Stmt {
+public:
+    bool isConst;
+    std::string name;
+    ExprPtr init;
+
+    VarDeclStmt(bool isConst, std::string name, ExprPtr init)
+        : Stmt(ASTNodeType::VarDeclStmt),
+          isConst(isConst),
+          name(std::move(name)),
+          init(std::move(init)) {}
+};
+
+class AssignStmt : public Stmt {
+public:
+    std::string name;
+    ExprPtr value;
+
+    AssignStmt(std::string name, ExprPtr value)
+        : Stmt(ASTNodeType::AssignStmt),
+          name(std::move(name)),
+          value(std::move(value)) {}
 };
 
 class NumberLiteral : public Expr {
