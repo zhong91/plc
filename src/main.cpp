@@ -18,7 +18,13 @@ int main() {
         toycc::Token(toycc::TokenType::Number, "2", 2, 16),
         toycc::Token(toycc::TokenType::Star, "*", 2, 18),
         toycc::Token(toycc::TokenType::Number, "3", 2, 20),
-        toycc::Token(toycc::TokenType::Semicolon, ";", 2, 21),
+        toycc::Token(toycc::TokenType::Greater, ">", 2, 22),
+        toycc::Token(toycc::TokenType::Number, "5", 2, 24),
+        toycc::Token(toycc::TokenType::LogicalAnd, "&&", 2, 26),
+        toycc::Token(toycc::TokenType::Number, "4", 2, 29),
+        toycc::Token(toycc::TokenType::NotEqual, "!=", 2, 31),
+        toycc::Token(toycc::TokenType::Number, "0", 2, 34),
+        toycc::Token(toycc::TokenType::Semicolon, ";", 2, 35),
 
         toycc::Token(toycc::TokenType::RBrace, "}", 3, 1),
         toycc::Token(toycc::TokenType::EndOfFile, "", 3, 2)
@@ -28,7 +34,7 @@ int main() {
     toycc::ASTNodePtr ast = parser.parse();
 
     if (ast != nullptr) {
-        std::cerr << "Parser parsed expression 1 + 2 * 3 successfully.\n";
+        std::cerr << "Parser parsed logical expression successfully.\n";
     }
 
     return 0;

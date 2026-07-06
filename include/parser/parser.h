@@ -27,6 +27,9 @@ private:
     StmtPtr parseStmt();
 
     ExprPtr parseExpr();
+    ExprPtr parseLOrExpr();
+    ExprPtr parseLAndExpr();
+    ExprPtr parseRelExpr();
     ExprPtr parseAddExpr();
     ExprPtr parseMulExpr();
     ExprPtr parseUnaryExpr();

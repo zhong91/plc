@@ -91,7 +91,59 @@ StmtPtr Parser::parseStmt() {
 }
 
 ExprPtr Parser::parseExpr() {
-    return parseAddExpr();
+    return parseLOrExpr();
+}
+
+ExprPtr Parser::parseLOrExpr() {
+    ExprPtr expr = parseLAndExpr();
+
+    while (match(TokenType::LogicalOr)) {
+        ExprPtr right = parseLAndExpr();
+        expr = std::make_shared<BinaryExpr>("||", expr, right);
+    }
+
+    return expr;
+}
+
+ExprPtr Parser::parseLAndExpr() {
+    ExprPtr expr = parseRelExpr();
+
+    while (match(TokenType::LogicalAnd)) {
+        ExprPtr right = parseRelExpr();
+        expr = std::make_shared<BinaryExpr>("&&", expr, right);
+    }
+
+    return expr;
+}
+
+ExprPtr Parser::parseRelExpr() {
+    ExprPtr expr = parseAddExpr();
+
+    while (true) {
+        if (match(TokenType::Less)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>("<", expr, right);
+        } else if (match(TokenType::Greater)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>(">", expr, right);
+        } else if (match(TokenType::LessEqual)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>("<=", expr, right);
+        } else if (match(TokenType::GreaterEqual)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>(">=", expr, right);
+        } else if (match(TokenType::Equal)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>("==", expr, right);
+        } else if (match(TokenType::NotEqual)) {
+            ExprPtr right = parseAddExpr();
+            expr = std::make_shared<BinaryExpr>("!=", expr, right);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
 }
 
 ExprPtr Parser::parseAddExpr() {
