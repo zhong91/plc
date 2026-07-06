@@ -19,6 +19,8 @@ enum class ASTNodeType {
     AssignStmt,
     IfStmt,
     WhileStmt,
+    BreakStmt,
+    ContinueStmt,
 
     BinaryExpr,
     UnaryExpr,
@@ -171,6 +173,18 @@ public:
         : Stmt(ASTNodeType::WhileStmt),
           condition(std::move(condition)),
           body(std::move(body)) {}
+};
+
+class BreakStmt : public Stmt {
+public:
+    BreakStmt()
+        : Stmt(ASTNodeType::BreakStmt) {}
+};
+
+class ContinueStmt : public Stmt {
+public:
+    ContinueStmt()
+        : Stmt(ASTNodeType::ContinueStmt) {}
 };
 
 class NumberLiteral : public Expr {

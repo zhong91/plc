@@ -114,6 +114,16 @@ StmtPtr Parser::parseStmt() {
         return std::make_shared<ReturnStmt>(value);
     }
 
+    if (match(TokenType::KwBreak)) {
+        consume(TokenType::Semicolon, "Expected ';' after break statement.");
+        return std::make_shared<BreakStmt>();
+    }
+
+    if (match(TokenType::KwContinue)) {
+        consume(TokenType::Semicolon, "Expected ';' after continue statement.");
+        return std::make_shared<ContinueStmt>();
+    }
+
     if (match(TokenType::KwIf)) {
         return parseIfStmt();
     }
