@@ -51,6 +51,7 @@ private:
     bool isAtEnd() const;
     bool check(TokenType type) const;
     bool checkNext(TokenType type) const;
+    bool checkAhead(std::size_t offset, TokenType type) const;
     bool match(TokenType type);
 
     const Token& advance();

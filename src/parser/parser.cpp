@@ -21,7 +21,26 @@ std::shared_ptr<CompUnit> Parser::parseCompUnit() {
     auto compUnit = std::make_shared<CompUnit>();
 
     while (!isAtEnd()) {
-        compUnit->units.push_back(parseFunctionDef());
+        if (match(TokenType::KwConst)) {
+            compUnit->units.push_back(parseVarDeclStmt(true));
+            continue;
+        }
+
+        if (check(TokenType::KwInt)) {
+            if (checkAhead(2, TokenType::LParen)) {
+                compUnit->units.push_back(parseFunctionDef());
+            } else {
+                compUnit->units.push_back(parseVarDeclStmt(false));
+            }
+            continue;
+        }
+
+        if (check(TokenType::KwVoid)) {
+            compUnit->units.push_back(parseFunctionDef());
+            continue;
+        }
+
+        throw std::runtime_error("Expected global declaration or function definition.");
     }
 
     return compUnit;
@@ -407,6 +426,14 @@ bool Parser::checkNext(TokenType type) const {
     }
 
     return tokens[current + 1].type == type;
+}
+
+bool Parser::checkAhead(std::size_t offset, TokenType type) const {
+    if (current + offset >= tokens.size()) {
+        return false;
+    }
+
+    return tokens[current + offset].type == type;
 }
 
 bool Parser::match(TokenType type) {
