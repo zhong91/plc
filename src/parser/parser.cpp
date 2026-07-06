@@ -115,8 +115,12 @@ StmtPtr Parser::parseStmt() {
     }
 
     if (match(TokenType::KwIf)) {
-    return parseIfStmt();
-}
+        return parseIfStmt();
+    }
+
+    if (match(TokenType::KwWhile)) {
+        return parseWhileStmt();
+    }
 
     if (match(TokenType::KwConst)) {
         return parseVarDeclStmt(true);
@@ -157,6 +161,21 @@ StmtPtr Parser::parseIfStmt() {
         condition,
         thenBranch,
         elseBranch
+    );
+}
+
+StmtPtr Parser::parseWhileStmt() {
+    consume(TokenType::LParen, "Expected '(' after while.");
+
+    ExprPtr condition = parseExpr();
+
+    consume(TokenType::RParen, "Expected ')' after while condition.");
+
+    StmtPtr body = parseStmt();
+
+    return std::make_shared<WhileStmt>(
+        condition,
+        body
     );
 }
 

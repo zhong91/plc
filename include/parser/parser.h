@@ -32,6 +32,7 @@ private:
     StmtPtr parseVarDeclStmt(bool isConst);
     StmtPtr parseAssignStmt();
     StmtPtr parseIfStmt();
+    StmtPtr parseWhileStmt();
 
     ExprPtr parseExpr();
     ExprPtr parseLOrExpr();
