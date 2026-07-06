@@ -18,6 +18,7 @@ enum class ASTNodeType {
 
     BinaryExpr,
     UnaryExpr,
+    FunctionCall,
 
     NumberLiteral,
     Variable
@@ -54,6 +55,14 @@ using ASTNodePtr = std::shared_ptr<ASTNode>;
 using ExprPtr = std::shared_ptr<Expr>;
 using StmtPtr = std::shared_ptr<Stmt>;
 
+struct Param {
+    ValueType type;
+    std::string name;
+
+    Param(ValueType type, std::string name)
+        : type(type), name(std::move(name)) {}
+};
+
 class CompUnit : public ASTNode {
 public:
     std::vector<ASTNodePtr> units;
@@ -74,12 +83,19 @@ class FunctionDef : public ASTNode {
 public:
     ValueType returnType;
     std::string name;
+    std::vector<Param> params;
     std::shared_ptr<Block> body;
 
-    FunctionDef(ValueType returnType, std::string name, std::shared_ptr<Block> body)
+    FunctionDef(
+        ValueType returnType,
+        std::string name,
+        std::vector<Param> params,
+        std::shared_ptr<Block> body
+    )
         : ASTNode(ASTNodeType::Function),
           returnType(returnType),
           name(std::move(name)),
+          params(std::move(params)),
           body(std::move(body)) {}
 };
 
@@ -129,6 +145,17 @@ public:
           op(std::move(op)),
           left(std::move(left)),
           right(std::move(right)) {}
+};
+
+class FunctionCall : public Expr {
+public:
+    std::string name;
+    std::vector<ExprPtr> args;
+
+    FunctionCall(std::string name, std::vector<ExprPtr> args)
+        : Expr(ASTNodeType::FunctionCall),
+          name(std::move(name)),
+          args(std::move(args)) {}
 };
 
 } // namespace toycc

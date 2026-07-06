@@ -33,6 +33,12 @@ std::shared_ptr<FunctionDef> Parser::parseFunctionDef() {
     Token nameToken = consume(TokenType::Identifier, "Expected function name.");
 
     consume(TokenType::LParen, "Expected '(' after function name.");
+
+    std::vector<Param> params;
+    if (!check(TokenType::RParen)) {
+        params = parseParams();
+    }
+
     consume(TokenType::RParen, "Expected ')' after function parameters.");
 
     auto body = parseBlock();
@@ -40,6 +46,7 @@ std::shared_ptr<FunctionDef> Parser::parseFunctionDef() {
     return std::make_shared<FunctionDef>(
         returnType,
         nameToken.lexeme,
+        params,
         body
     );
 }
@@ -54,6 +61,26 @@ ValueType Parser::parseType() {
     }
 
     throw std::runtime_error("Expected type name: int or void.");
+}
+
+std::vector<Param> Parser::parseParams() {
+    std::vector<Param> params;
+
+    params.push_back(parseParam());
+
+    while (match(TokenType::Comma)) {
+        params.push_back(parseParam());
+    }
+
+    return params;
+}
+
+Param Parser::parseParam() {
+    consume(TokenType::KwInt, "Expected 'int' in function parameter.");
+
+    Token nameToken = consume(TokenType::Identifier, "Expected parameter name.");
+
+    return Param(ValueType::Int, nameToken.lexeme);
 }
 
 std::shared_ptr<Block> Parser::parseBlock() {
@@ -211,7 +238,21 @@ ExprPtr Parser::parsePrimaryExpr() {
     }
 
     if (match(TokenType::Identifier)) {
-        return std::make_shared<Variable>(previous().lexeme);
+        std::string name = previous().lexeme;
+
+        if (match(TokenType::LParen)) {
+            std::vector<ExprPtr> args;
+
+            if (!check(TokenType::RParen)) {
+                args = parseArgs();
+            }
+
+            consume(TokenType::RParen, "Expected ')' after function arguments.");
+
+            return std::make_shared<FunctionCall>(name, args);
+        }
+
+        return std::make_shared<Variable>(name);
     }
 
     if (match(TokenType::LParen)) {
@@ -221,6 +262,18 @@ ExprPtr Parser::parsePrimaryExpr() {
     }
 
     throw std::runtime_error("Expected expression.");
+}
+
+std::vector<ExprPtr> Parser::parseArgs() {
+    std::vector<ExprPtr> args;
+
+    args.push_back(parseExpr());
+
+    while (match(TokenType::Comma)) {
+        args.push_back(parseExpr());
+    }
+
+    return args;
 }
 
 const Token& Parser::peek() const {

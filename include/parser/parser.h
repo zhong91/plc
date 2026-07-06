@@ -22,7 +22,11 @@ private:
 
     std::shared_ptr<CompUnit> parseCompUnit();
     std::shared_ptr<FunctionDef> parseFunctionDef();
+
     ValueType parseType();
+    std::vector<Param> parseParams();
+    Param parseParam();
+
     std::shared_ptr<Block> parseBlock();
     StmtPtr parseStmt();
 
@@ -34,6 +38,8 @@ private:
     ExprPtr parseMulExpr();
     ExprPtr parseUnaryExpr();
     ExprPtr parsePrimaryExpr();
+
+    std::vector<ExprPtr> parseArgs();
 
     const Token& peek() const;
     const Token& previous() const;
