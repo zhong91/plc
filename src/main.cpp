@@ -6,13 +6,24 @@
 
 int main() {
     std::vector<toycc::Token> tokens = {
-        toycc::Token(toycc::TokenType::EndOfFile, "", 1, 1)
+        toycc::Token(toycc::TokenType::KwInt, "int", 1, 1),
+        toycc::Token(toycc::TokenType::Identifier, "main", 1, 5),
+        toycc::Token(toycc::TokenType::LParen, "(", 1, 9),
+        toycc::Token(toycc::TokenType::RParen, ")", 1, 10),
+        toycc::Token(toycc::TokenType::LBrace, "{", 1, 12),
+        toycc::Token(toycc::TokenType::KwReturn, "return", 2, 5),
+        toycc::Token(toycc::TokenType::Number, "1", 2, 12),
+        toycc::Token(toycc::TokenType::Semicolon, ";", 2, 13),
+        toycc::Token(toycc::TokenType::RBrace, "}", 3, 1),
+        toycc::Token(toycc::TokenType::EndOfFile, "", 3, 2)
     };
 
     toycc::Parser parser(tokens);
-    parser.parse();
+    toycc::ASTNodePtr ast = parser.parse();
 
-    std::cerr << "Parser basic test passed.\n";
+    if (ast != nullptr) {
+        std::cerr << "Parser parsed int main(){return 1;} successfully.\n";
+    }
 
     return 0;
 }

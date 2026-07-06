@@ -14,9 +14,103 @@ Parser::Parser(const std::vector<Token>& tokens)
 }
 
 ASTNodePtr Parser::parse() {
-    // 现在先返回空。
-    // 后面我们会把这里改成真正解析整个 ToyC 程序。
-    return nullptr;
+    return parseCompUnit();
+}
+
+std::shared_ptr<CompUnit> Parser::parseCompUnit() {
+    auto compUnit = std::make_shared<CompUnit>();
+
+    while (!isAtEnd()) {
+        compUnit->units.push_back(parseFunctionDef());
+    }
+
+    return compUnit;
+}
+
+std::shared_ptr<FunctionDef> Parser::parseFunctionDef() {
+    ValueType returnType = parseType();
+
+    Token nameToken = consume(TokenType::Identifier, "Expected function name.");
+
+    consume(TokenType::LParen, "Expected '(' after function name.");
+    consume(TokenType::RParen, "Expected ')' after function parameters.");
+
+    auto body = parseBlock();
+
+    return std::make_shared<FunctionDef>(
+        returnType,
+        nameToken.lexeme,
+        body
+    );
+}
+
+ValueType Parser::parseType() {
+    if (match(TokenType::KwInt)) {
+        return ValueType::Int;
+    }
+
+    if (match(TokenType::KwVoid)) {
+        return ValueType::Void;
+    }
+
+    throw std::runtime_error("Expected type name: int or void.");
+}
+
+std::shared_ptr<Block> Parser::parseBlock() {
+    consume(TokenType::LBrace, "Expected '{' before block.");
+
+    auto block = std::make_shared<Block>();
+
+    while (!check(TokenType::RBrace) && !isAtEnd()) {
+        block->statements.push_back(parseStmt());
+    }
+
+    consume(TokenType::RBrace, "Expected '}' after block.");
+
+    return block;
+}
+
+StmtPtr Parser::parseStmt() {
+    if (match(TokenType::KwReturn)) {
+        ExprPtr value = nullptr;
+
+        if (!check(TokenType::Semicolon)) {
+            value = parseExpr();
+        }
+
+        consume(TokenType::Semicolon, "Expected ';' after return statement.");
+
+        return std::make_shared<ReturnStmt>(value);
+    }
+
+    if (check(TokenType::LBrace)) {
+        return parseBlock();
+    }
+
+    throw std::runtime_error("Unsupported statement.");
+}
+
+ExprPtr Parser::parseExpr() {
+    return parsePrimaryExpr();
+}
+
+ExprPtr Parser::parsePrimaryExpr() {
+    if (match(TokenType::Number)) {
+        int value = std::stoi(previous().lexeme);
+        return std::make_shared<NumberLiteral>(value);
+    }
+
+    if (match(TokenType::Identifier)) {
+        return std::make_shared<Variable>(previous().lexeme);
+    }
+
+    if (match(TokenType::LParen)) {
+        ExprPtr expr = parseExpr();
+        consume(TokenType::RParen, "Expected ')' after expression.");
+        return expr;
+    }
+
+    throw std::runtime_error("Expected expression.");
 }
 
 const Token& Parser::peek() const {
@@ -35,6 +129,7 @@ bool Parser::check(TokenType type) const {
     if (isAtEnd()) {
         return type == TokenType::EndOfFile;
     }
+
     return peek().type == type;
 }
 
@@ -43,16 +138,13 @@ bool Parser::match(TokenType type) {
         advance();
         return true;
     }
+
     return false;
 }
 
 const Token& Parser::advance() {
     if (!isAtEnd()) {
         current++;
-    }
-
-    if (current == 0) {
-        return tokens[0];
     }
 
     return previous();

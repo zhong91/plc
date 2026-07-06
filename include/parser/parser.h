@@ -1,11 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
-#include <vector>
 #include <string>
+#include <vector>
 
-#include "common/token.h"
 #include "ast/ast.h"
+#include "common/token.h"
 
 namespace toycc {
 
@@ -18,6 +19,14 @@ public:
 private:
     std::vector<Token> tokens;
     std::size_t current = 0;
+
+    std::shared_ptr<CompUnit> parseCompUnit();
+    std::shared_ptr<FunctionDef> parseFunctionDef();
+    ValueType parseType();
+    std::shared_ptr<Block> parseBlock();
+    StmtPtr parseStmt();
+    ExprPtr parseExpr();
+    ExprPtr parsePrimaryExpr();
 
     const Token& peek() const;
     const Token& previous() const;
