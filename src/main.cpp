@@ -4,6 +4,7 @@
 #include "ast/ast_printer.h"
 #include "common/token.h"
 #include "parser/parser.h"
+#include "semantic/semantic_checker.h"
 
 int main() {
     std::vector<toycc::Token> tokens = {
@@ -45,9 +46,10 @@ int main() {
     toycc::ASTNodePtr ast = parser.parse();
     toycc::ASTPrinter::print(ast, std::cerr);
 
-    if (ast != nullptr) {
-        std::cerr << "Parser parsed global declarations successfully.\n";
-    }
+    toycc::SemanticChecker checker;
+    checker.check(ast);
+
+    std::cerr << "Parser and semantic analysis completed successfully.\n";
 
     return 0;
 }
