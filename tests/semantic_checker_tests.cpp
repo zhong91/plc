@@ -126,6 +126,64 @@ struct TestRunner {
                       << error.what() << '\n';
         }
     }
+    void expectGlobalSymbolQueries() {
+    const std::string testName = "global symbol query interfaces";
+
+    try {
+        auto root = program({
+            decl(
+                true,
+                "ANSWER",
+                binary("+", number(40), number(2))
+            ),
+            decl(false, "globalValue", number(7)),
+            validMain({ret(number(0))})
+        });
+
+        SemanticChecker checker;
+        checker.check(root);
+
+        const auto answerValue = checker.getConstValue("ANSWER");
+        const auto variableValue = checker.getConstValue("globalValue");
+
+        const bool correct =
+            // 全局常量 ANSWER
+            checker.exists("ANSWER") &&
+            checker.isGlobal("ANSWER") &&
+            checker.isConstant("ANSWER") &&
+            answerValue.has_value() &&
+            *answerValue == 42 &&
+
+            // 普通全局变量 globalValue
+            checker.exists("globalValue") &&
+            checker.isGlobal("globalValue") &&
+            !checker.isConstant("globalValue") &&
+            !variableValue.has_value() &&
+
+            // 不存在的标识符
+            !checker.exists("missing") &&
+            !checker.isGlobal("missing") &&
+            !checker.isConstant("missing") &&
+            !checker.getConstValue("missing").has_value();
+
+        if (!correct) {
+            ++failed;
+            std::cerr
+                << "[FAIL] " << testName
+                << ": query result did not match expectation.\n";
+            return;
+        }
+
+        ++passed;
+        std::cout << "[PASS] " << testName << '\n';
+    } catch (const std::exception& error) {
+        ++failed;
+        std::cerr
+            << "[FAIL] " << testName
+            << ": unexpected error: "
+            << error.what() << '\n';
+    }
+}
 };
 
 } // namespace
@@ -405,7 +463,7 @@ int main() {
         }),
         "duplicate declaration of 'f'"
     );
-
+tests.expectGlobalSymbolQueries();
     std::cout << "\n" << tests.passed << " passed, " << tests.failed
               << " failed.\n";
     return tests.failed == 0 ? 0 : 1;
