@@ -5,6 +5,8 @@
 #include "common/token.h"
 #include "parser/parser.h"
 #include "semantic/semantic_checker.h"
+#include "ir/ir_builder.h"
+#include "codegen/riscv_generator.h"
 
 int main() {
     std::vector<toycc::Token> tokens = {
@@ -42,14 +44,30 @@ int main() {
         toycc::Token(toycc::TokenType::EndOfFile, "", 6, 2)
     };
 
-    toycc::Parser parser(tokens);
-    toycc::ASTNodePtr ast = parser.parse();
-    toycc::ASTPrinter::print(ast, std::cerr);
+    try {
+        // 1. Parser（A）
+        toycc::Parser parser(tokens);
+        toycc::ASTNodePtr ast = parser.parse();
+        toycc::ASTPrinter::print(ast, std::cerr);  // 调试信息
 
-    toycc::SemanticChecker checker;
-    checker.check(ast);
+        // 2. Semantic（D）
+        toycc::SemanticChecker checker;
+        checker.check(ast);
+        std::cerr << "[DEBUG] Semantic check passed\n";
 
-    std::cerr << "Parser and semantic analysis completed successfully.\n";
+        // 3. Code Generation（B - 你）
+        toycc::IRBuilder builder;
+        auto program = builder.build(ast, &checker);  // ★ 传入 checker
+        std::cerr << "[DEBUG] IR generation finished\n";
+
+        toycc::RiscvGenerator generator(std::cout);  // ★ 输出到 stdout
+        generator.generate(program);
+        std::cerr << "[DEBUG] Assembly generation finished\n";
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
 
     return 0;
 }
