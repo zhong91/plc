@@ -120,9 +120,38 @@ public:
         }
 
         validateMainFunction();
-        popScope();
+    }
+  bool exists(const std::string& name) const {
+    return lookup(name) != nullptr;
+  }
+
+  bool isGlobal(const std::string& name) const {
+    if (scopes_.empty()) {
+      return false;
     }
 
+    const auto found = scopes_.front().find(name);
+    if (found == scopes_.front().end()) {
+      return false;
+    }
+
+    return found->second.kind == SymbolKind::Variable ||
+           found->second.kind == SymbolKind::Constant;
+  }
+
+  bool isConstant(const std::string& name) const {
+    const Symbol* symbol = lookup(name);
+    return symbol != nullptr && symbol->kind == SymbolKind::Constant;
+  }
+
+  std::optional<std::int32_t> getConstValue(const std::string& name) const {
+    const Symbol* symbol = lookup(name);
+    if (symbol == nullptr || symbol->kind != SymbolKind::Constant) {
+      return std::nullopt;
+    }
+
+    return symbol->constantValue;
+  }
 private:
     std::vector<std::unordered_map<std::string, Symbol>> scopes_;
     ValueType currentReturnType_ = ValueType::Void;
@@ -999,9 +1028,39 @@ bool existsInCurrentScope(const std::string& name) const {
 
 } // namespace
 
+struct SemanticChecker::Impl {
+  Analyzer analyzer;
+};
+
+SemanticChecker::SemanticChecker()
+    : impl_(std::make_unique<Impl>()) {}
+
+SemanticChecker::~SemanticChecker() = default;
+
+SemanticChecker::SemanticChecker(SemanticChecker&&) noexcept = default;
+
+SemanticChecker& SemanticChecker::operator=(SemanticChecker&&) noexcept = default;
+
 void SemanticChecker::check(const ASTNodePtr& root) const {
-    Analyzer analyzer;
-    analyzer.check(root);
+  impl_->analyzer.check(root);
+}
+
+bool SemanticChecker::exists(const std::string& name) const {
+  return impl_->analyzer.exists(name);
+}
+
+bool SemanticChecker::isGlobal(const std::string& name) const {
+  return impl_->analyzer.isGlobal(name);
+}
+
+bool SemanticChecker::isConstant(const std::string& name) const {
+  return impl_->analyzer.isConstant(name);
+}
+
+std::optional<std::int32_t> SemanticChecker::getConstValue(
+    const std::string& name
+) const {
+  return impl_->analyzer.getConstValue(name);
 }
 
 } // namespace toycc
