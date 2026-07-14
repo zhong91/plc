@@ -9,47 +9,43 @@
 
 namespace toycc {
 
-// ★ 这些仍然保留，用于测试模式（checker 为空时）
+// 测试模式下的模拟数据（当 checker 为空时使用）
 static std::map<std::string, int> mockOffsetMap;
 static int nextOffset = 0;
 static int labelCounter = 0;
 static std::set<std::string> globalNames;
 static std::map<std::string, int> functionParamCounts;
 
-// 循环栈
+// 循环栈，用于 break/continue
 static std::vector<std::pair<std::string, std::string>> loopStack;
 
-// ★ 当前使用的 SemanticChecker（由 IRBuilder 设置）
+// 当前使用的语义检查器
 static const SemanticChecker* currentChecker = nullptr;
 
 std::string newLabel() { return ".L" + std::to_string(labelCounter++); }
 
 void buildStmt(const StmtPtr& stmt, IRFunction& irFunc);
 
-// ★★★ 辅助：判断变量是否全局 ★★★
+// 判断是否为全局变量
 bool isGlobalVar(const std::string& name) {
     if (currentChecker) {
         return currentChecker->isGlobal(name);
     }
-    // 测试模式：从 globalNames 查询
     return globalNames.find(name) != globalNames.end();
 }
 
-// ★★★ 辅助：获取变量栈偏移（仅局部变量）★★★
+// 获取局部变量的栈偏移
 int getVarOffset(const std::string& name) {
     if (currentChecker) {
-        // 如果有符号表，确保变量存在（语义检查已通过）
         if (!currentChecker->exists(name)) {
             throw std::runtime_error("Variable '" + name + "' not found in symbol table");
         }
-        // 偏移量由后端分配，从 mockOffsetMap 查询
         auto it = mockOffsetMap.find(name);
         if (it == mockOffsetMap.end()) {
             throw std::runtime_error("No offset allocated for variable '" + name + "'");
         }
         return it->second;
     }
-    // 测试模式：从 mockOffsetMap 查询
     auto it = mockOffsetMap.find(name);
     if (it == mockOffsetMap.end()) {
         throw std::runtime_error("Variable '" + name + "' not found (test mode)");
@@ -57,14 +53,15 @@ int getVarOffset(const std::string& name) {
     return it->second;
 }
 
-// ★★★ 辅助：获取常量值 ★★★
+// 判断是否为常量变量
 bool isConstantVar(const std::string& name) {
     if (currentChecker) {
         return currentChecker->isConstant(name);
     }
-    return false;  // 测试模式不支持常量查询
+    return false;
 }
 
+// 获取常量值
 int getConstValue(const std::string& name) {
     if (currentChecker) {
         auto val = currentChecker->getConstValue(name);
@@ -76,7 +73,7 @@ int getConstValue(const std::string& name) {
     throw std::runtime_error("Cannot get const value in test mode");
 }
 
-// ★★★ 表达式处理（支持逻辑运算 && ||）★★★
+// 生成表达式代码
 void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
     if (auto num = std::dynamic_pointer_cast<NumberLiteral>(expr)) {
         irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(num->value));
@@ -84,17 +81,13 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
     }
     
     if (auto var = std::dynamic_pointer_cast<Variable>(expr)) {
-        // ★ 优先使用符号表判断是否为全局变量
         if (isGlobalVar(var->name)) {
             irFunc.instrs.emplace_back(IRInstrType::LOAD_GLOBAL, "t0", var->name);
         } else {
-            // ★ 检查是否为常量（符号表模式）
             if (currentChecker && isConstantVar(var->name)) {
-                // 常量直接加载值，不访问内存
                 int val = getConstValue(var->name);
                 irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(val));
             } else {
-                // 局部变量：从栈加载
                 int offset = getVarOffset(var->name);
                 irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(offset));
             }
@@ -114,7 +107,7 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
     }
 
     if (auto bin = std::dynamic_pointer_cast<BinaryExpr>(expr)) {
-        // ★ 逻辑运算 && 和 ||
+        // 处理逻辑与和逻辑或（短路求值）
         if (bin->op == "&&" || bin->op == "||") {
             std::string shortLabel = newLabel();
             std::string endLabel = newLabel();
@@ -137,7 +130,7 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
             return;
         }
 
-        // 算术运算
+        // 处理算术运算
         if (bin->op == "+" || bin->op == "-" || bin->op == "*" ||
             bin->op == "/" || bin->op == "%") {
             buildExpr(bin->left, irFunc);
@@ -152,7 +145,7 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
             irFunc.instrs.emplace_back(opType, "t0", "t1", "t0");
             return;
         }
-        // 比较运算
+        // 处理比较运算
         buildExpr(bin->left, irFunc);
         irFunc.instrs.emplace_back(IRInstrType::MV, "t1", "t0");
         buildExpr(bin->right, irFunc);
@@ -178,7 +171,7 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
     throw std::runtime_error("Unknown expression");
 }
 
-// ★★★ 语句处理 ★★★
+// 生成语句代码
 void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
     if (!stmt) return;
 
@@ -189,14 +182,12 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ 变量声明
+    // 变量声明
     if (auto varDecl = std::dynamic_pointer_cast<VarDeclStmt>(stmt)) {
-        // 分配栈偏移量（只对局部变量，全局变量已在顶层收集）
         int offset = nextOffset;
         nextOffset += 4;
         mockOffsetMap[varDecl->name] = offset;
 
-        // 处理初始化表达式
         if (varDecl->init) {
             buildExpr(varDecl->init, irFunc);
             irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(offset));
@@ -204,7 +195,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ 赋值语句
+    // 赋值语句
     if (auto assign = std::dynamic_pointer_cast<AssignStmt>(stmt)) {
         buildExpr(assign->value, irFunc);
         if (isGlobalVar(assign->name)) {
@@ -216,7 +207,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ Return 语句
+    // return 语句
     if (auto ret = std::dynamic_pointer_cast<ReturnStmt>(stmt)) {
         if (ret->value) {
             buildExpr(ret->value, irFunc);
@@ -226,7 +217,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ If 语句
+    // if 语句
     if (auto ifStmt = std::dynamic_pointer_cast<IfStmt>(stmt)) {
         std::string elseLabel = newLabel();
         std::string endLabel = newLabel();
@@ -242,7 +233,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ While 语句
+    // while 语句
     if (auto whileStmt = std::dynamic_pointer_cast<WhileStmt>(stmt)) {
         std::string loopLabel = newLabel();
         std::string endLabel = newLabel();
@@ -257,7 +248,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ Break
+    // break 语句
     if (auto breakStmt = std::dynamic_pointer_cast<BreakStmt>(stmt)) {
         if (loopStack.empty()) {
             throw std::runtime_error("break outside loop");
@@ -266,7 +257,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ Continue
+    // continue 语句
     if (auto continueStmt = std::dynamic_pointer_cast<ContinueStmt>(stmt)) {
         if (loopStack.empty()) {
             throw std::runtime_error("continue outside loop");
@@ -275,18 +266,16 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // ★ ExprStmt（表达式语句）
+    // 表达式语句
     if (auto exprStmt = std::dynamic_pointer_cast<ExprStmt>(stmt)) {
         buildExpr(exprStmt->expr, irFunc);
         return;
     }
 }
 
-// ★★★ IRBuilder::build ★★★
+// 构建整个程序的中间表示
 IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checker) {
-    // ★ 设置当前 checker（供辅助函数使用）
     currentChecker = checker;
-
     IRProgram program;
     auto compUnit = std::dynamic_pointer_cast<CompUnit>(root);
     if (!compUnit) throw std::runtime_error("Root is not CompUnit");
@@ -297,10 +286,8 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
     // 第一遍：收集全局变量和函数信息
     for (const auto& unit : compUnit->units) {
         if (auto varDecl = std::dynamic_pointer_cast<VarDeclStmt>(unit)) {
-            // 如果有符号表，从符号表获取常量值；否则从 AST 读取
             int initValue = 0;
             if (checker && varDecl->isConst) {
-                // 从符号表获取常量值
                 auto val = checker->getConstValue(varDecl->name);
                 if (val.has_value()) {
                     initValue = val.value();
@@ -320,7 +307,7 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
         }
     }
 
-    // 第二遍：处理函数
+    // 第二遍：生成函数代码
     for (const auto& unit : compUnit->units) {
         if (auto funcDef = std::dynamic_pointer_cast<FunctionDef>(unit)) {
             IRFunction irFunc;
@@ -328,13 +315,13 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
             irFunc.paramCount = funcDef->params.size();
             irFunc.isVoid = (funcDef->returnType == ValueType::Void);
 
-            // ★ 重置后端状态（每个函数独立）
+            // 重置函数级状态
             mockOffsetMap.clear();
             nextOffset = 0;
             labelCounter = 0;
             loopStack.clear();
 
-            // 参数作为局部变量（分配偏移量）
+            // 参数作为局部变量压栈
             for (size_t i = 0; i < funcDef->params.size() && i < 8; ++i) {
                 int offset = nextOffset;
                 nextOffset += 4;
@@ -348,7 +335,7 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
                 buildStmt(funcDef->body, irFunc);
             }
 
-            // 如果函数没有 return，自动添加 RET
+            // 若函数末尾无返回，自动补充 RET
             if (irFunc.instrs.empty() || irFunc.instrs.back().type != IRInstrType::RET) {
                 irFunc.instrs.emplace_back(IRInstrType::RET);
             }
@@ -357,7 +344,6 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
         }
     }
 
-    // ★ 清理
     currentChecker = nullptr;
     return program;
 }

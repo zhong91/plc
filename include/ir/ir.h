@@ -10,7 +10,7 @@ enum class IRInstrType {
     MV,
     ADD, SUB, MUL, DIV, REM,
     SLT, SEQZ, SNEZ,
-    LABEL, JUMP, BRANCH_ZERO, BRANCH_NONZERO,  // 新增
+    LABEL, JUMP, BRANCH_ZERO, BRANCH_NONZERO, 
     CALL,
     RET,
 };

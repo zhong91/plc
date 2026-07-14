@@ -55,12 +55,12 @@ int main() {
         checker.check(ast);
         std::cerr << "[DEBUG] Semantic check passed\n";
 
-        // 3. Code Generation（B - 你）
+        // 3. Code Generation
         toycc::IRBuilder builder;
-        auto program = builder.build(ast, &checker);  // ★ 传入 checker
+        auto program = builder.build(ast, &checker);  // 传入 checker
         std::cerr << "[DEBUG] IR generation finished\n";
 
-        toycc::RiscvGenerator generator(std::cout);  // ★ 输出到 stdout
+        toycc::RiscvGenerator generator(std::cout);  // 输出到 stdout
         generator.generate(program);
         std::cerr << "[DEBUG] Assembly generation finished\n";
 
