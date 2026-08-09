@@ -116,12 +116,27 @@ Token Lexer::makeIdentifierOrKeyword() {
     return Token(type, word, startLine, startCol);
 }
 
-// 处理数字（目前只支持非负整数）
+// 处理数字（非负整数）。按 ToyC 规范：要么是单个 0，要么第一位不能是 0。
 Token Lexer::makeNumber() {
     int startLine = line_;
     int startCol = column_;
     std::string num;
 
+    // 第一位
+    if (peek() == '0') {
+        num += advance();
+        // 如果是 "00..." 或 "07" 这种前导零形式要报错
+        if (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
+            throw std::runtime_error(
+                "Lexer error at line " + std::to_string(startLine) +
+                ", column " + std::to_string(startCol) +
+                ": number with leading zeros is not allowed"
+            );
+        }
+        return Token(TokenType::Number, num, startLine, startCol);
+    }
+
+    // [1-9][0-9]*
     while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
         num += advance();
     }
@@ -206,8 +221,56 @@ Token Lexer::makeOperatorOrPunctuator() {
 
 // ---------- 主入口 ----------
 
+// 判断 '-' 在此位置是否为负数字面量的一部分。
+// 当前一个 Token 可能是操作数 (Identifier/Number/) 或右括号/关键字(后接减号时代表运算符)。
+// 只有 "开头 / 运算符 / 关键字(非return break等) / 赋值 / 逗号 / 分号 / 左括号"
+// 之后出现的 '-' 才有资格是一元负号，结合作业要求 "-?NUMBER"，我们
+// 把 "-数字" 合成一个 NUMBER Token。
+static bool isUnaryContext(TokenType prev) {
+    switch (prev) {
+        case TokenType::EndOfFile:     // 开头
+        case TokenType::KwConst:
+        case TokenType::KwInt:
+        case TokenType::KwVoid:
+        case TokenType::KwIf:
+        case TokenType::KwElse:
+        case TokenType::KwWhile:
+        case TokenType::KwBreak:
+        case TokenType::KwContinue:
+        case TokenType::KwReturn:
+
+        case TokenType::Plus:
+        case TokenType::Minus:
+        case TokenType::Star:
+        case TokenType::Slash:
+        case TokenType::Percent:
+
+        case TokenType::Assign:
+        case TokenType::Equal:
+        case TokenType::NotEqual:
+        case TokenType::Less:
+        case TokenType::LessEqual:
+        case TokenType::Greater:
+        case TokenType::GreaterEqual:
+
+        case TokenType::LogicalAnd:
+        case TokenType::LogicalOr:
+        case TokenType::LogicalNot:
+
+        case TokenType::LParen:
+        case TokenType::LBrace:
+        case TokenType::Comma:
+        case TokenType::Semicolon:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 std::vector<Token> Lexer::tokenize() {
     std::vector<Token> tokens;
+    TokenType prevType = TokenType::EndOfFile;
 
     while (true) {
         skipWhitespaceAndComments();
@@ -219,9 +282,31 @@ std::vector<Token> Lexer::tokenize() {
             tokens.push_back(makeIdentifierOrKeyword());
         } else if (std::isdigit(static_cast<unsigned char>(c))) {
             tokens.push_back(makeNumber());
+        } else if (c == '-' && isUnaryContext(prevType) &&
+                   std::isdigit(static_cast<unsigned char>(peekNext()))) {
+            // 一元负号 + 数字 → 合并为负的 NUMBER Token
+            int startLine = line_;
+            int startCol = column_;
+            advance(); // 吃掉 '-'
+            std::string num = "-";
+            // 验证数字部分（递归调用不现实，直接内联校验规则）
+            if (peek() == '0' &&
+                std::isdigit(static_cast<unsigned char>(peekNext()))) {
+                throw std::runtime_error(
+                    "Lexer error at line " + std::to_string(startLine) +
+                    ", column " + std::to_string(startCol) +
+                    ": number with leading zeros is not allowed"
+                );
+            }
+            while (!isAtEnd() && std::isdigit(static_cast<unsigned char>(peek()))) {
+                num += advance();
+            }
+            tokens.emplace_back(TokenType::Number, num, startLine, startCol);
         } else {
             tokens.push_back(makeOperatorOrPunctuator());
         }
+
+        prevType = tokens.back().type;
     }
 
     // 文档要求：末尾必须有一个 EndOfFile Token

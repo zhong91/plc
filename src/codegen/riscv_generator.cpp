@@ -34,7 +34,9 @@ void RiscvGenerator::emitInstr(const IRInstr& instr) {
             emitLine("    call " + instr.src1);
             break;
         case IRInstrType::RET:
-            // RET 指令本身不输出，在 generate() 中统一添加 ret 以配合栈帧恢复
+            // RET 标记本身不输出指令；ret 统一由 generate() 在函数末尾、
+            // 栈帧恢复之后发出。这样可以避免一条函数里有多条 ret 指令时，
+            // 每条都得写一次栈帧恢复代码的麻烦。
             break;
         default:
             break;
@@ -44,7 +46,7 @@ void RiscvGenerator::emitInstr(const IRInstr& instr) {
 void RiscvGenerator::generate(const IRProgram& program) {
     std::cerr << "[DEBUG] RiscvGenerator::generate called" << std::endl;
 
-    // 数据段：全局变量
+    // -------------------- 数据段：全局变量 --------------------
     if (!program.globalVars.empty()) {
         emitLine(".data");
         for (const auto& [name, value] : program.globalVars) {
@@ -54,28 +56,34 @@ void RiscvGenerator::generate(const IRProgram& program) {
         }
     }
 
-    // 代码段
+    // -------------------- 代码段 --------------------
     emitLine(".section .text");
-    // 所有函数对外可见，支持互相调用
     for (const auto& func : program.functions) {
         emitLine(".globl " + func.name);
     }
 
     for (const auto& func : program.functions) {
         emitLine(func.name + ":");
-        // 分配栈帧（16 字节：保存 ra + 对齐）
-        int frameSize = 16;
-        emitLine("    addi sp, sp, -" + std::to_string(frameSize));
-        emitLine("    sw ra, 12(sp)");
 
+        // 帧大小 = 对齐到16字节的(局部区大小 + 4字节存ra)
+        int frameSize = func.localSize + 4;
+        if (frameSize % 16 != 0) {
+            frameSize += 16 - (frameSize % 16);
+        }
+        int raOffset = frameSize - 4;   // ra 保存在帧顶部
+
+        // 序言：分配栈帧，保存 ra
+        emitLine("    addi sp, sp, -" + std::to_string(frameSize));
+        emitLine("    sw ra, " + std::to_string(raOffset) + "(sp)");
+
+        // 函数体指令
         for (const auto& instr : func.instrs) {
             emitInstr(instr);
         }
 
-        // 恢复栈帧并返回
-        emitLine("    lw ra, 12(sp)");
+        // 尾声：恢复 ra，回收栈帧，返回
+        emitLine("    lw ra, " + std::to_string(raOffset) + "(sp)");
         emitLine("    addi sp, sp, " + std::to_string(frameSize));
-        // IR 中的 RET 不生成指令，此处统一添加 ret，确保在栈恢复之后返回
         emitLine("    ret");
     }
 }
