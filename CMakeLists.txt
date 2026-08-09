@@ -11,9 +11,12 @@ if(MSVC)
 endif()
 
 add_library(toycc_frontend
+    src/lexer/lexer.cpp
     src/parser/parser.cpp
     src/ast/ast_printer.cpp
     src/semantic/semantic_checker.cpp
+    src/ir/ir_builder.cpp
+    src/codegen/riscv_generator.cpp
 )
 
 target_include_directories(toycc_frontend PUBLIC
