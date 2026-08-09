@@ -35,20 +35,13 @@ bool isGlobalVar(const std::string& name) {
 }
 
 // 获取局部变量的栈偏移
+// 注意：不能依赖 SemanticChecker::exists()，因为语义检查完成后局部作用域
+// 已被 pop，参数和局部变量在 checker 里查不到。IRBuilder 自己在
+// mockOffsetMap 里维护了参数与局部变量的栈偏移，这才是权威来源。
 int getVarOffset(const std::string& name) {
-    if (currentChecker) {
-        if (!currentChecker->exists(name)) {
-            throw std::runtime_error("Variable '" + name + "' not found in symbol table");
-        }
-        auto it = mockOffsetMap.find(name);
-        if (it == mockOffsetMap.end()) {
-            throw std::runtime_error("No offset allocated for variable '" + name + "'");
-        }
-        return it->second;
-    }
     auto it = mockOffsetMap.find(name);
     if (it == mockOffsetMap.end()) {
-        throw std::runtime_error("Variable '" + name + "' not found (test mode)");
+        throw std::runtime_error("No offset allocated for variable '" + name + "'");
     }
     return it->second;
 }
