@@ -33,6 +33,7 @@ struct IRFunction {
     std::vector<IRInstr> instrs;
     int paramCount = 0;
     bool isVoid = false;
+    int localSize = 0;   // 局部变量 + 参数 + 临时spill区 总字节数
 };
 
 struct IRProgram {

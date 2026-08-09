@@ -1,66 +1,52 @@
 #include <iostream>
-#include <vector>
+#include <sstream>
+#include <string>
 
 #include "ast/ast_printer.h"
-#include "common/token.h"
+#include "codegen/riscv_generator.h"
+#include "ir/ir_builder.h"
+#include "lexer/lexer.h"
 #include "parser/parser.h"
 #include "semantic/semantic_checker.h"
-#include "ir/ir_builder.h"
-#include "codegen/riscv_generator.h"
 
-int main() {
-    std::vector<toycc::Token> tokens = {
-        // const int A = 1;
-        toycc::Token(toycc::TokenType::KwConst, "const", 1, 1),
-        toycc::Token(toycc::TokenType::KwInt, "int", 1, 7),
-        toycc::Token(toycc::TokenType::Identifier, "A", 1, 11),
-        toycc::Token(toycc::TokenType::Assign, "=", 1, 13),
-        toycc::Token(toycc::TokenType::Number, "1", 1, 15),
-        toycc::Token(toycc::TokenType::Semicolon, ";", 1, 16),
+int main(int argc, char* argv[]) {
+    // 支持 -opt 标志：目前未实现优化，仅保证评测时不报错
+    bool enableOpt = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-opt") {
+            enableOpt = true;
+        }
+    }
+    (void)enableOpt;  // 预留：后续可在此处启用优化通道
 
-        // int g = 2;
-        toycc::Token(toycc::TokenType::KwInt, "int", 2, 1),
-        toycc::Token(toycc::TokenType::Identifier, "g", 2, 5),
-        toycc::Token(toycc::TokenType::Assign, "=", 2, 7),
-        toycc::Token(toycc::TokenType::Number, "2", 2, 9),
-        toycc::Token(toycc::TokenType::Semicolon, ";", 2, 10),
-
-        // int main() {
-        toycc::Token(toycc::TokenType::KwInt, "int", 4, 1),
-        toycc::Token(toycc::TokenType::Identifier, "main", 4, 5),
-        toycc::Token(toycc::TokenType::LParen, "(", 4, 9),
-        toycc::Token(toycc::TokenType::RParen, ")", 4, 10),
-        toycc::Token(toycc::TokenType::LBrace, "{", 4, 12),
-
-        // return A + g;
-        toycc::Token(toycc::TokenType::KwReturn, "return", 5, 5),
-        toycc::Token(toycc::TokenType::Identifier, "A", 5, 12),
-        toycc::Token(toycc::TokenType::Plus, "+", 5, 14),
-        toycc::Token(toycc::TokenType::Identifier, "g", 5, 16),
-        toycc::Token(toycc::TokenType::Semicolon, ";", 5, 17),
-
-        // }
-        toycc::Token(toycc::TokenType::RBrace, "}", 6, 1),
-        toycc::Token(toycc::TokenType::EndOfFile, "", 6, 2)
-    };
+    // 1. 从 stdin 读取全部 ToyC 源代码
+    std::ostringstream buffer;
+    buffer << std::cin.rdbuf();
+    std::string source = buffer.str();
 
     try {
-        // 1. Parser（A）
+        // 2. Lexer：源代码 -> Token 序列
+        toycc::Lexer lexer(source);
+        std::vector<toycc::Token> tokens = lexer.tokenize();
+
+        // 3. Parser：Token 序列 -> AST
         toycc::Parser parser(tokens);
         toycc::ASTNodePtr ast = parser.parse();
         toycc::ASTPrinter::print(ast, std::cerr);  // 调试信息
 
-        // 2. Semantic（D）
+        // 4. Semantic：语义检查
         toycc::SemanticChecker checker;
         checker.check(ast);
         std::cerr << "[DEBUG] Semantic check passed\n";
 
-        // 3. Code Generation
+        // 5. IR 生成
         toycc::IRBuilder builder;
         auto program = builder.build(ast, &checker);  // 传入 checker
         std::cerr << "[DEBUG] IR generation finished\n";
 
-        toycc::RiscvGenerator generator(std::cout);  // 输出到 stdout
+        // 6. RISC-V 汇编生成（输出到 stdout）
+        toycc::RiscvGenerator generator(std::cout);
         generator.generate(program);
         std::cerr << "[DEBUG] Assembly generation finished\n";
 
