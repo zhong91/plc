@@ -18,6 +18,7 @@ add_library(toycc_frontend
     src/ir/ir_builder.cpp
     src/codegen/riscv_generator.cpp
     src/opt/compile_time_evaluator.cpp
+    src/opt/ir_optimizer.cpp
 )
 
 target_include_directories(toycc_frontend PUBLIC
