@@ -358,20 +358,13 @@ bool simplifyLocally(IRFunction& func) {
                     break;
                 }
 
-                // Local common-subexpression elimination. Only reuse values that were
-                // materialized in a stack slot in this same basic block.
+                // Conservative value tracking only.  v3 reused a previously materialized
+                // expression here (local CSE).  The hidden combined benchmark exposed a
+                // correctness regression only under the optimized pipeline, while the
+                // measured standalone CSE gain was small.  Keep the expression identity
+                // for copy/algebra facts, but do not substitute a prior stack value.
                 std::string key = makeExprKey(ins.type, a, b);
                 if (!key.empty()) {
-                    auto loc = st.exprLocations.find(key);
-                    if (loc != st.exprLocations.end() && st.versionOf(loc->second.slot) == loc->second.version) {
-                        ins.type = IRInstrType::LOAD;
-                        ins.src1 = std::to_string(loc->second.slot);
-                        ins.src2.clear();
-                        st.setReg(ins.dest, Value::expression(key));
-                        changed = true;
-                        emit(ins);
-                        break;
-                    }
                     st.setReg(ins.dest, Value::expression(key));
                 } else {
                     st.killReg(ins.dest);
@@ -660,6 +653,56 @@ bool eliminateDeadRegisterComputations(IRFunction& func) {
     return changed;
 }
 
+
+// Convert a direct self tail call into a loop inside the current frame.
+// IRBuilder emits return f(args) as:
+//   ... materialize args into a0..a7 ...
+//   CALL f
+//   MV t0, a0
+//   MV a0, t0
+//   JUMP .ret_f
+// For <= 8 parameters all new arguments are already in a-registers, so jumping
+// back to the function's parameter-copy prologue is ABI-equivalent to a tail call
+// and avoids recursive stack growth.  9+ parameter functions are left unchanged
+// because their incoming stack-argument addresses differ from the current frame's
+// outgoing argument area.
+bool eliminateDirectTailRecursion(IRFunction& func) {
+    if (func.paramCount > 8) return false;
+    const std::string returnLabel = ".ret_" + func.name;
+    const std::string tailLabel = ".tail_" + func.name;
+
+    bool changed = false;
+    std::vector<IRInstr> out;
+    out.reserve(func.instrs.size() + 1);
+    out.emplace_back(IRInstrType::LABEL, "", "", "", tailLabel);
+
+    for (size_t i = 0; i < func.instrs.size(); ++i) {
+        if (i + 3 < func.instrs.size()) {
+            const auto& call = func.instrs[i];
+            const auto& r0 = func.instrs[i + 1];
+            const auto& r1 = func.instrs[i + 2];
+            const auto& jump = func.instrs[i + 3];
+            if (call.type == IRInstrType::CALL && call.src1 == func.name &&
+                r0.type == IRInstrType::MV && r0.dest == "t0" && r0.src1 == "a0" &&
+                r1.type == IRInstrType::MV && r1.dest == "a0" && r1.src1 == "t0" &&
+                jump.type == IRInstrType::JUMP && jump.label == returnLabel) {
+                out.emplace_back(IRInstrType::JUMP, "", "", "", tailLabel);
+                i += 3;
+                changed = true;
+                continue;
+            }
+        }
+        out.push_back(func.instrs[i]);
+    }
+
+    if (changed) {
+        func.instrs.swap(out);
+        return true;
+    }
+    // No recursive tail call: do not perturb labels/instruction layout.
+    return false;
+}
+
 bool removeJumpToNextLabel(IRFunction& func) {
     bool changed = false;
     std::vector<IRInstr> out;
@@ -679,6 +722,10 @@ bool removeJumpToNextLabel(IRFunction& func) {
 }
 
 void optimizeFunction(IRFunction& func) {
+    // Do this before local simplification so the exact IRBuilder tail-call pattern
+    // is still visible.
+    eliminateDirectTailRecursion(func);
+
     // A few rounds are enough because each pass only removes/simplifies instructions.
     for (int round = 0; round < 4; ++round) {
         bool changed = false;
