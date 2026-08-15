@@ -15,7 +15,6 @@ int main(int argc, char* argv[]) {
             enableOpt = true;
         }
     }
-
     std::ostringstream buffer;
     buffer << std::cin.rdbuf();
     std::string source = buffer.str();
@@ -27,13 +26,10 @@ int main(int argc, char* argv[]) {
         toycc::Parser parser(tokens);
         toycc::ASTNodePtr ast = parser.parse();
 
-        // 先做完整语义检查；只有合法程序才进入优化或后端。
         toycc::SemanticChecker checker;
         checker.check(ast);
-
         if (enableOpt) {
-            // ToyC 没有 I/O/运行时输入。优先尝试整程序编译期求值；成功时直接输出
-            // 等价的常量 main，运行期开销接近最小。若预算耗尽，则自动回退普通后端。
+            // 只给整程序求值一个很小预算；大程序快速回退到真正的后端优化。
             if (auto value = toycc::tryEvaluateMainAtCompileTime(ast, 20000ULL); value.has_value()) {
                 toycc::emitConstantMain(std::cout, *value);
                 return 0;
@@ -42,8 +38,8 @@ int main(int argc, char* argv[]) {
 
         toycc::IRBuilder builder;
         auto program = builder.build(ast, &checker);
-
-        toycc::RiscvGenerator generator(std::cout);
+        // 功能测试（无 -opt）沿用原后端行为；性能测试（-opt）启用寄存器提升和 spill 窥孔优化。
+        toycc::RiscvGenerator generator(std::cout, enableOpt);
         generator.generate(program);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
