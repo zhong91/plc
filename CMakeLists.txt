@@ -17,6 +17,7 @@ add_library(toycc_frontend
     src/semantic/semantic_checker.cpp
     src/ir/ir_builder.cpp
     src/codegen/riscv_generator.cpp
+    src/opt/compile_time_evaluator.cpp
 )
 
 target_include_directories(toycc_frontend PUBLIC
