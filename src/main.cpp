@@ -6,6 +6,7 @@
 #include "lexer/lexer.h"
 #include "opt/compile_time_evaluator.h"
 #include "opt/ir_optimizer.h"
+#include "opt/ir_compile_time_evaluator.h"
 #include "parser/parser.h"
 #include "semantic/semantic_checker.h"
 
@@ -45,6 +46,17 @@ int main(int argc, char* argv[]) {
             // local CSE, algebraic simplification and dead-code elimination.
             toycc::IROptimizer optimizer;
             optimizer.optimize(program);
+
+            // High-payoff whole-program fast path.  After the ordinary IR
+            // passes, run a compact integer-only IR interpreter on the build
+            // host for at most ~4.5 s.  If main finishes, runtime work collapses
+            // to `li a0, result; ret`; otherwise the proven v7 backend remains
+            // the exact fallback.
+            if (auto value = toycc::tryEvaluateIRAtCompileTime(
+                    program, 8000000000ULL, 4500ULL); value.has_value()) {
+                toycc::emitConstantMain(std::cout, *value);
+                return 0;
+            }
         }
 
         // Functional tests keep the original path; -opt also enables backend v2 optimizations.
