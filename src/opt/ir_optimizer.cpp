@@ -358,13 +358,36 @@ bool simplifyLocally(IRFunction& func) {
                     break;
                 }
 
-                // Conservative value tracking only.  v3 reused a previously materialized
-                // expression here (local CSE).  The hidden combined benchmark exposed a
-                // correctness regression only under the optimized pipeline, while the
-                // measured standalone CSE gain was small.  Keep the expression identity
-                // for copy/algebra facts, but do not substitute a prior stack value.
-                std::string key = makeExprKey(ins.type, a, b);
+                // Conservative local CSE.  Re-enable only the high-value, easy-to-prove
+                // cases: both operands must be constants or direct values of unchanged
+                // local stack slots, and the operation must be a simple add/sub/mul/slt.
+                // In particular, do not CSE nested Expression values, DIV/REM, or values
+                // whose provenance cannot be tied to a current slot version.
+                const bool cseOp = ins.type == IRInstrType::ADD ||
+                                   ins.type == IRInstrType::SUB ||
+                                   ins.type == IRInstrType::MUL ||
+                                   ins.type == IRInstrType::SLT;
+                const auto atomicForCse = [&](const Value& v) {
+                    if (v.kind == ValueKind::Constant) return true;
+                    return v.kind == ValueKind::SlotValue && aliasStillValid(v, st);
+                };
+
+                std::string key;
+                if (cseOp && atomicForCse(a) && atomicForCse(b)) {
+                    key = makeExprKey(ins.type, a, b);
+                }
                 if (!key.empty()) {
+                    auto loc = st.exprLocations.find(key);
+                    if (loc != st.exprLocations.end() &&
+                        st.versionOf(loc->second.slot) == loc->second.version) {
+                        ins.type = IRInstrType::LOAD;
+                        ins.src1 = std::to_string(loc->second.slot);
+                        ins.src2.clear();
+                        st.setReg(ins.dest, Value::expression(key));
+                        changed = true;
+                        emit(ins);
+                        break;
+                    }
                     st.setReg(ins.dest, Value::expression(key));
                 } else {
                     st.killReg(ins.dest);
