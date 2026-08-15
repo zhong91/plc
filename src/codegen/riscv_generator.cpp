@@ -243,6 +243,315 @@ bool RiscvGenerator::tryEmitSpillPeephole(const std::vector<IRInstr>& v, size_t&
     return true;
 }
 
+
+std::string RiscvGenerator::promotedRegForSlot(int logicalOffset) const {
+    auto it = currentPromotedSlots.find(logicalOffset);
+    return it == currentPromotedSlots.end() ? std::string{} : it->second;
+}
+
+bool RiscvGenerator::emitSimpleValueToReg(const IRInstr& instr, const std::string& dest) {
+    switch (instr.type) {
+        case IRInstrType::LI:
+            if (instr.dest != "t0") return false;
+            emitLine("    li " + dest + ", " + instr.src1);
+            return true;
+        case IRInstrType::LOAD: {
+            if (instr.dest != "t0") return false;
+            int logicalOffset = std::stoi(instr.src1);
+            std::string srcReg = promotedRegForSlot(logicalOffset);
+            if (!srcReg.empty()) {
+                if (dest != srcReg) emitLine("    mv " + dest + ", " + srcReg);
+            } else {
+                emitLoadFromSp(dest, currentLocalBase + logicalOffset);
+            }
+            return true;
+        }
+        case IRInstrType::LOAD_ARG: {
+            if (instr.dest != "t0") return false;
+            int argOffset = std::stoi(instr.src1);
+            emitLoadFromSp(dest, currentFrameSize + argOffset);
+            return true;
+        }
+        case IRInstrType::LOAD_GLOBAL:
+            if (instr.dest != "t0") return false;
+            emitLine("    la t6, " + instr.src1);
+            emitLine("    lw " + dest + ", 0(t6)");
+            return true;
+        case IRInstrType::MV:
+            if (instr.dest != "t0") return false;
+            if (dest != instr.src1) emitLine("    mv " + dest + ", " + instr.src1);
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 合并常见的“产生 t0 -> 立刻写槽/返回”模式，避免无意义的 t0 中转。
+bool RiscvGenerator::tryEmitSimplePair(const std::vector<IRInstr>& v, size_t& i) {
+    if (i + 1 >= v.size()) return false;
+    const auto& a = v[i];
+    const auto& b = v[i + 1];
+
+    if (b.type == IRInstrType::STORE && b.src1 == "t0") {
+        int dstOff = std::stoi(b.src2);
+        std::string dstReg = promotedRegForSlot(dstOff);
+        if (!dstReg.empty() && emitSimpleValueToReg(a, dstReg)) {
+            i += 1;
+            return true;
+        }
+
+        // LOAD x -> STORE y 可以直接在寄存器/内存之间搬运，不必经过 t0。
+        if (a.type == IRInstrType::LOAD && a.dest == "t0") {
+            int srcOff = std::stoi(a.src1);
+            std::string srcReg = promotedRegForSlot(srcOff);
+            if (!srcReg.empty()) {
+                if (dstReg.empty()) emitStoreToSp(srcReg, currentLocalBase + dstOff);
+                else if (dstReg != srcReg) emitLine("    mv " + dstReg + ", " + srcReg);
+                i += 1;
+                return true;
+            }
+        }
+    }
+
+    // return / 参数装载：LOAD promoted -> MV aX,t0 直接使用 s 寄存器。
+    if (b.type == IRInstrType::MV && b.src1 == "t0") {
+        if (a.type == IRInstrType::LOAD && a.dest == "t0") {
+            std::string srcReg = promotedRegForSlot(std::stoi(a.src1));
+            if (!srcReg.empty()) {
+                if (b.dest != srcReg) emitLine("    mv " + b.dest + ", " + srcReg);
+                i += 1;
+                return true;
+            }
+        }
+        if (a.type == IRInstrType::LI && a.dest == "t0") {
+            emitLine("    li " + b.dest + ", " + a.src1);
+            i += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 识别 IRBuilder 的完整赋值模式：
+// LOAD lhs; STORE spill; RHS; LOAD spill->t1; OP; STORE dst
+// 对寄存器提升后的热点变量直接在 s 寄存器上运算。
+bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, size_t& i) {
+    if (i + 5 >= v.size()) return false;
+    const auto& lhs = v[i];
+    const auto& spill = v[i + 1];
+    const auto& rhs = v[i + 2];
+    const auto& reload = v[i + 3];
+    const auto& op = v[i + 4];
+    const auto& store = v[i + 5];
+
+    if (lhs.type != IRInstrType::LOAD || lhs.dest != "t0") return false;
+    if (spill.type != IRInstrType::STORE || spill.src1 != "t0") return false;
+    if (reload.type != IRInstrType::LOAD || reload.dest != "t1" || reload.src1 != spill.src2) return false;
+    if (!isCoreBinaryOp(op.type) || op.dest != "t0" || op.src1 != "t1" || op.src2 != "t0") return false;
+    if (store.type != IRInstrType::STORE || store.src1 != "t0") return false;
+
+    std::string lhsReg = promotedRegForSlot(std::stoi(lhs.src1));
+    std::string dstReg = promotedRegForSlot(std::stoi(store.src2));
+    if (lhsReg.empty() || dstReg.empty()) return false;
+
+    auto copyLhs = [&]() {
+        if (dstReg != lhsReg) emitLine("    mv " + dstReg + ", " + lhsReg);
+    };
+
+    if (rhs.type == IRInstrType::LI && rhs.dest == "t0") {
+        long long imm = std::stoll(rhs.src1);
+        switch (op.type) {
+            case IRInstrType::ADD:
+                if (imm == 0) { copyLhs(); }
+                else if (imm >= -2048 && imm <= 2047) {
+                    emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                } else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    add " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            case IRInstrType::SUB: {
+                long long neg = -imm;
+                if (imm == 0) { copyLhs(); }
+                else if (neg >= -2048 && neg <= 2047) {
+                    emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(neg));
+                } else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    sub " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            }
+            case IRInstrType::MUL:
+                if (imm == 0) emitLine("    li " + dstReg + ", 0");
+                else if (imm == 1) copyLhs();
+                else if (imm == -1) emitLine("    neg " + dstReg + ", " + lhsReg);
+                else if (imm > 0 && (imm & (imm - 1)) == 0) {
+                    int sh = 0; long long x = imm; while (x > 1) { ++sh; x >>= 1; }
+                    emitLine("    slli " + dstReg + ", " + lhsReg + ", " + std::to_string(sh));
+                } else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    mul " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            case IRInstrType::DIV:
+                if (imm == 1) copyLhs();
+                else if (imm == -1) emitLine("    neg " + dstReg + ", " + lhsReg);
+                else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    div " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            case IRInstrType::REM:
+                if (imm == 1 || imm == -1) emitLine("    li " + dstReg + ", 0");
+                else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    rem " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            case IRInstrType::SLT:
+                if (imm >= -2048 && imm <= 2047) {
+                    emitLine("    slti " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                } else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    slt " + dstReg + ", " + lhsReg + ", t1");
+                }
+                break;
+            default:
+                return false;
+        }
+        i += 5;
+        return true;
+    }
+
+    if (rhs.type == IRInstrType::LOAD && rhs.dest == "t0") {
+        int rhsOff = std::stoi(rhs.src1);
+        std::string rhsReg = promotedRegForSlot(rhsOff);
+        if (rhsReg.empty()) {
+            emitLoadFromSp("t1", currentLocalBase + rhsOff);
+            rhsReg = "t1";
+        }
+        const char* mnemonic = nullptr;
+        switch (op.type) {
+            case IRInstrType::ADD: mnemonic = "add"; break;
+            case IRInstrType::SUB: mnemonic = "sub"; break;
+            case IRInstrType::MUL: mnemonic = "mul"; break;
+            case IRInstrType::DIV: mnemonic = "div"; break;
+            case IRInstrType::REM: mnemonic = "rem"; break;
+            case IRInstrType::SLT: mnemonic = "slt"; break;
+            default: return false;
+        }
+        emitLine("    " + std::string(mnemonic) + " " + dstReg + ", " + lhsReg + ", " + rhsReg);
+        i += 5;
+        return true;
+    }
+    return false;
+}
+
+// 把“算出 0/1 再 beqz/bnez”融合成 RISC-V 直接比较分支。
+bool RiscvGenerator::tryEmitCompareBranch(const std::vector<IRInstr>& v, size_t& i) {
+    if (i + 5 >= v.size()) return false;
+    const auto& lhs = v[i];
+    const auto& spill = v[i + 1];
+    const auto& rhs = v[i + 2];
+    const auto& reload = v[i + 3];
+    const auto& op = v[i + 4];
+    if (lhs.type != IRInstrType::LOAD || lhs.dest != "t0") return false;
+    if (spill.type != IRInstrType::STORE || spill.src1 != "t0") return false;
+    if (reload.type != IRInstrType::LOAD || reload.dest != "t1" || reload.src1 != spill.src2) return false;
+
+    std::string lhsReg = promotedRegForSlot(std::stoi(lhs.src1));
+    if (lhsReg.empty()) return false;
+
+    std::string rhsReg;
+    auto prepareRhs = [&]() -> bool {
+        if (rhs.type == IRInstrType::LI && rhs.dest == "t0") {
+            emitLine("    li t1, " + rhs.src1);
+            rhsReg = "t1";
+            return true;
+        }
+        if (rhs.type == IRInstrType::LOAD && rhs.dest == "t0") {
+            rhsReg = promotedRegForSlot(std::stoi(rhs.src1));
+            if (rhsReg.empty()) {
+                emitLoadFromSp("t1", currentLocalBase + std::stoi(rhs.src1));
+                rhsReg = "t1";
+            }
+            return true;
+        }
+        return false;
+    };
+
+    std::string cond;
+    size_t branchIndex = 0;
+    if (op.type == IRInstrType::SLT && op.dest == "t0") {
+        // < 和 > 没有后续规范化；<=/>= 会紧跟 SEQZ。
+        if (i + 6 < v.size() && v[i + 5].type == IRInstrType::SEQZ &&
+            v[i + 5].dest == "t0" && v[i + 5].src1 == "t0") {
+            if (op.src1 == "t0" && op.src2 == "t1") cond = "le";       // !(rhs < lhs)
+            else if (op.src1 == "t1" && op.src2 == "t0") cond = "ge";  // !(lhs < rhs)
+            else return false;
+            branchIndex = i + 6;
+        } else {
+            if (op.src1 == "t1" && op.src2 == "t0") cond = "lt";
+            else if (op.src1 == "t0" && op.src2 == "t1") cond = "gt";
+            else return false;
+            branchIndex = i + 5;
+        }
+    } else if (op.type == IRInstrType::SUB && op.dest == "t0" &&
+               op.src1 == "t1" && op.src2 == "t0" && i + 6 < v.size()) {
+        const auto& norm = v[i + 5];
+        if (norm.dest != "t0" || norm.src1 != "t0") return false;
+        if (norm.type == IRInstrType::SEQZ) cond = "eq";
+        else if (norm.type == IRInstrType::SNEZ) cond = "ne";
+        else return false;
+        branchIndex = i + 6;
+    } else {
+        return false;
+    }
+
+    if (branchIndex >= v.size()) return false;
+    const auto& br = v[branchIndex];
+    if ((br.type != IRInstrType::BRANCH_ZERO && br.type != IRInstrType::BRANCH_NONZERO) || br.src1 != "t0") return false;
+    if (!prepareRhs()) return false;
+
+    bool whenTrue = br.type == IRInstrType::BRANCH_NONZERO;
+    std::string mnemonic, a = lhsReg, b = rhsReg;
+    if (cond == "eq") mnemonic = whenTrue ? "beq" : "bne";
+    else if (cond == "ne") mnemonic = whenTrue ? "bne" : "beq";
+    else if (cond == "lt") mnemonic = whenTrue ? "blt" : "bge";
+    else if (cond == "gt") { mnemonic = whenTrue ? "blt" : "bge"; std::swap(a, b); }
+    else if (cond == "le") { mnemonic = whenTrue ? "bge" : "blt"; std::swap(a, b); }
+    else if (cond == "ge") mnemonic = whenTrue ? "bge" : "blt";
+    else return false;
+
+    emitLine("    " + mnemonic + " " + a + ", " + b + ", " + br.label);
+    i = branchIndex;
+    return true;
+}
+
+// if (x) / while (x) 这类条件直接在提升后的寄存器上分支。
+bool RiscvGenerator::tryEmitDirectValueBranch(const std::vector<IRInstr>& v, size_t& i) {
+    if (i + 1 >= v.size()) return false;
+    const auto& val = v[i];
+    const auto& br = v[i + 1];
+    if ((br.type != IRInstrType::BRANCH_ZERO && br.type != IRInstrType::BRANCH_NONZERO) || br.src1 != "t0") return false;
+
+    if (val.type == IRInstrType::LOAD && val.dest == "t0") {
+        std::string reg = promotedRegForSlot(std::stoi(val.src1));
+        if (reg.empty()) return false;
+        emitLine(std::string("    ") + (br.type == IRInstrType::BRANCH_ZERO ? "beqz " : "bnez ") + reg + ", " + br.label);
+        i += 1;
+        return true;
+    }
+    if (val.type == IRInstrType::LI && val.dest == "t0") {
+        long long x = std::stoll(val.src1);
+        bool jump = (br.type == IRInstrType::BRANCH_ZERO) ? (x == 0) : (x != 0);
+        if (jump) emitLine("    j " + br.label);
+        i += 1;
+        return true;
+    }
+    return false;
+}
+
 void RiscvGenerator::generate(const IRProgram& program) {
     if (!program.globalVars.empty()) {
         emitLine(".data");
@@ -294,6 +603,10 @@ void RiscvGenerator::generate(const IRProgram& program) {
         if (hasCall) emitStoreToSp("ra", raOffset);
 
         for (size_t i = 0; i < func.instrs.size(); ++i) {
+            if (optimize && tryEmitCompareBranch(func.instrs, i)) continue;
+            if (optimize && tryEmitDirectBinaryUpdate(func.instrs, i)) continue;
+            if (optimize && tryEmitDirectValueBranch(func.instrs, i)) continue;
+            if (optimize && tryEmitSimplePair(func.instrs, i)) continue;
             if (optimize && tryEmitSpillPeephole(func.instrs, i)) continue;
             if (optimize && func.instrs[i].type == IRInstrType::JUMP &&
                 i + 1 < func.instrs.size() &&

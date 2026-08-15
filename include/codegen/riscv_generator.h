@@ -23,6 +23,12 @@ private:
     void emitStoreToSp(const std::string& src, int offset);
     std::vector<std::pair<int, std::string>> choosePromotedSlots(const IRFunction& func) const;
     bool tryEmitSpillPeephole(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitSimplePair(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitCompareBranch(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitDirectValueBranch(const std::vector<IRInstr>& instrs, size_t& index);
+    bool emitSimpleValueToReg(const IRInstr& instr, const std::string& dest);
+    std::string promotedRegForSlot(int logicalOffset) const;
     static bool isCoreBinaryOp(IRInstrType type);
 
 public:
