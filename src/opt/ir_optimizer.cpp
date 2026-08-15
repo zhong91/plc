@@ -363,10 +363,12 @@ bool simplifyLocally(IRFunction& func) {
                 // local stack slots, and the operation must be a simple add/sub/mul/slt.
                 // In particular, do not CSE nested Expression values, DIV/REM, or values
                 // whose provenance cannot be tied to a current slot version.
+                // v6: CSE only arithmetic values.  Keep comparison results out of
+                // the value-numbering cache; normalized relational expressions are
+                // cheap, branch-heavy, and much more sensitive to control-flow shape.
                 const bool cseOp = ins.type == IRInstrType::ADD ||
                                    ins.type == IRInstrType::SUB ||
-                                   ins.type == IRInstrType::MUL ||
-                                   ins.type == IRInstrType::SLT;
+                                   ins.type == IRInstrType::MUL;
                 const auto atomicForCse = [&](const Value& v) {
                     if (v.kind == ValueKind::Constant) return true;
                     return v.kind == ValueKind::SlotValue && aliasStillValid(v, st);

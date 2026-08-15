@@ -646,6 +646,32 @@ bool RiscvGenerator::tryEmitOptimizedCompareBranch(const std::vector<IRInstr>& v
     if ((br.type != IRInstrType::BRANCH_ZERO && br.type != IRInstrType::BRANCH_NONZERO) || br.src1 != "t0") return false;
     if (!prepareRhs()) return false;
 
+    // v6 safety path: for normalized comparisons (==, !=, <=, >=), preserve
+    // the IR operation order exactly instead of algebraically inverting the
+    // condition into a single branch.  We still eliminate all stack spills.
+    if (cond == "eq" || cond == "ne" || cond == "le" || cond == "ge") {
+        auto mapSrc = [&](const std::string& r) -> std::string {
+            if (r == "t1") return lhsReg;
+            if (r == "t0") return rhsReg;
+            return r;
+        };
+        if (op.type == IRInstrType::SUB) {
+            emitLine("    sub t0, " + mapSrc(op.src1) + ", " + mapSrc(op.src2));
+        } else if (op.type == IRInstrType::SLT) {
+            emitLine("    slt t0, " + mapSrc(op.src1) + ", " + mapSrc(op.src2));
+        } else {
+            return false;
+        }
+        const auto& norm = v[branchIndex - 1];
+        if (norm.type == IRInstrType::SEQZ) emitLine("    seqz t0, t0");
+        else if (norm.type == IRInstrType::SNEZ) emitLine("    snez t0, t0");
+        else return false;
+        emitLine(std::string("    ") +
+                 (br.type == IRInstrType::BRANCH_ZERO ? "beqz t0, " : "bnez t0, ") + br.label);
+        i = branchIndex;
+        return true;
+    }
+
     bool whenTrue = br.type == IRInstrType::BRANCH_NONZERO;
     std::string mnemonic, a = lhsReg, b = rhsReg;
     if (cond == "eq") mnemonic = whenTrue ? "beq" : "bne";
@@ -726,6 +752,32 @@ bool RiscvGenerator::tryEmitCompareBranch(const std::vector<IRInstr>& v, size_t&
     const auto& br = v[branchIndex];
     if ((br.type != IRInstrType::BRANCH_ZERO && br.type != IRInstrType::BRANCH_NONZERO) || br.src1 != "t0") return false;
     if (!prepareRhs()) return false;
+
+    // Same safety rule for the original spill-form IR: keep strict < and >
+    // direct branches, but execute normalized comparisons exactly as the IR.
+    if (cond == "eq" || cond == "ne" || cond == "le" || cond == "ge") {
+        // lhs is already available in its promoted s-register; rhs is in rhsReg.
+        auto mapSrc = [&](const std::string& r) -> std::string {
+            if (r == "t1") return lhsReg;
+            if (r == "t0") return rhsReg;
+            return r;
+        };
+        if (op.type == IRInstrType::SUB) {
+            emitLine("    sub t0, " + mapSrc(op.src1) + ", " + mapSrc(op.src2));
+        } else if (op.type == IRInstrType::SLT) {
+            emitLine("    slt t0, " + mapSrc(op.src1) + ", " + mapSrc(op.src2));
+        } else {
+            return false;
+        }
+        const auto& norm = v[branchIndex - 1];
+        if (norm.type == IRInstrType::SEQZ) emitLine("    seqz t0, t0");
+        else if (norm.type == IRInstrType::SNEZ) emitLine("    snez t0, t0");
+        else return false;
+        emitLine(std::string("    ") +
+                 (br.type == IRInstrType::BRANCH_ZERO ? "beqz t0, " : "bnez t0, ") + br.label);
+        i = branchIndex;
+        return true;
+    }
 
     bool whenTrue = br.type == IRInstrType::BRANCH_NONZERO;
     std::string mnemonic, a = lhsReg, b = rhsReg;
