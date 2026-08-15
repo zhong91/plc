@@ -1,5 +1,6 @@
 #include "ir/ir_builder.h"
 #include "semantic/semantic_checker.h"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <map>
@@ -16,7 +17,6 @@ static std::map<std::string, int> functionParamCounts;
 
 // 循环栈：用于 break/continue 的标签
 static std::vector<std::pair<std::string, std::string>> loopStack;
-
 // 当前函数的统一返回标签（函数体内多处 return 都跳这里，然后走统一的尾声）
 static std::string currentReturnLabel;
 
@@ -24,14 +24,16 @@ static std::string currentReturnLabel;
 static const SemanticChecker* currentChecker = nullptr;
 
 // ====================== 函数级上下文（解决嵌套作用域 & 栈槽分配） ======================
-
 struct FuncContext {
     // 作用域栈：每个作用域一个 name -> offset 映射
     // 进入 Block push，离开 Block pop；变量查找从顶查到底，天然支持同名遮蔽
     std::vector<std::unordered_map<std::string, int>> scopes;
 
-    // 栈指针：下一个可用字节偏移（局部变量 + 参数 + 临时spill区全部共用）
+    // 下一个可用“逻辑局部偏移”（局部变量 + 参数副本 + 临时 spill 共用）
     int nextOffset = 0;
+
+    // 当前函数调用其它函数时，第 9+ 个实参所需的最大 outgoing 参数区。
+    int maxOutgoingArgBytes = 0;
 };
 
 static FuncContext* fctx = nullptr;  // 当前函数上下文（build 时设置）
@@ -48,7 +50,7 @@ static void scopePush() {
     fctx->scopes.emplace_back();
 }
 
-// 退出一个作用域（弹出，同名局部变量的槽由于是顺序递增分配，不再重用；这是安全的教学实现）
+// 退出一个作用域（槽位暂不重用，保证实现简单且安全）
 static void scopePop() {
     fctx->scopes.pop_back();
 }
@@ -60,15 +62,25 @@ static int declareVar(const std::string& name) {
     return off;
 }
 
-// 从内到外查找变量偏移（正确实现内层屏蔽外层）
-static int lookupVar(const std::string& name) {
+// 尝试从内到外查找局部变量。返回 true 表示局部/参数存在。
+static bool tryLookupVar(const std::string& name, int& offset) {
+    if (!fctx) return false;
     for (auto it = fctx->scopes.rbegin(); it != fctx->scopes.rend(); ++it) {
         auto f = it->find(name);
-        if (f != it->end()) return f->second;
+        if (f != it->end()) {
+            offset = f->second;
+            return true;
+        }
     }
-    throw std::runtime_error("No offset allocated for variable '" + name + "'");
+    return false;
 }
 
+// 从内到外查找变量偏移；不存在则报错
+static int lookupVar(const std::string& name) {
+    int offset = 0;
+    if (tryLookupVar(name, offset)) return offset;
+    throw std::runtime_error("No offset allocated for variable '" + name + "'");
+}
 // ====================================================================================
 
 std::string newLabel() { return ".L" + std::to_string(labelCounter++); }
@@ -109,11 +121,7 @@ int getConstValue(const std::string& name) {
 }
 
 // =============================== 表达式生成 ===============================
-// 所有表达式约定：计算结果存在 t0 中。计算过程中需要临时保持的值一律存到
-// 新分配的栈槽中，绝不再使用固定寄存器 t1 作"持有"用途，避免：
-//   (1) 嵌套 BinaryExpr 覆盖 t1
-//   (2) 右侧有 function call 时 t1 被 callee 当作临时寄存器破坏
-
+// 所有表达式约定：计算结果存在 t0 中。需要跨子表达式保存的值放入栈槽。
 void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
     // ------- 数字字面量 -------
     if (auto num = std::dynamic_pointer_cast<NumberLiteral>(expr)) {
@@ -123,46 +131,57 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
 
     // ------- 变量引用 -------
     if (auto var = std::dynamic_pointer_cast<Variable>(expr)) {
-        if (isGlobalVar(var->name)) {
+        // 必须局部优先：语义检查器的 isGlobal(name) 只说明全局表里有同名符号，
+        // 不能覆盖当前作用域中的局部变量/参数。
+        int localOffset = 0;
+        if (tryLookupVar(var->name, localOffset)) {
+            irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(localOffset));
+        } else if (isGlobalVar(var->name)) {
             irFunc.instrs.emplace_back(IRInstrType::LOAD_GLOBAL, "t0", var->name);
+        } else if (currentChecker && isConstantVar(var->name)) {
+            int val = getConstValue(var->name);
+            irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(val));
         } else {
-            if (currentChecker && isConstantVar(var->name)) {
-                int val = getConstValue(var->name);
-                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(val));
-            } else {
-                int offset = getVarOffset(var->name);
-                irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(offset));
-            }
+            int offset = getVarOffset(var->name); // 保留原有错误信息
+            irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(offset));
         }
         return;
     }
 
     // ------- 函数调用 -------
     if (auto call = std::dynamic_pointer_cast<FunctionCall>(expr)) {
-        // Step 1: 先把所有实参计算出来，全部存在栈槽里（每个实参 4 字节）
-        //         这一步防止：计算第 i+1 个实参时内部函数调用破坏之前已放入 aN 的值
+        // Step 1: 先求出所有实参并保存到本函数的逻辑局部槽。
+        // 这样后续实参中的嵌套调用不会破坏已计算的参数值。
         size_t n = call->args.size();
         std::vector<int> argSlots;
         argSlots.reserve(n);
+
         for (size_t i = 0; i < n; ++i) {
-            buildExpr(call->args[i], irFunc);     // 结果在 t0
+            buildExpr(call->args[i], irFunc); // 结果在 t0
             int slot = allocSlot();
             irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(slot));
             argSlots.push_back(slot);
         }
-        // Step 2: 从栈槽把参数依次搬运到 a0~a7
-        //         (对于≥9个参数，先不支持，抛清楚的错误，不在此静默截断)
-        if (n > 8) {
-            throw std::runtime_error(
-                "Function call '" + call->name + "' has " + std::to_string(n) +
-                " arguments; currently only up to 8 arguments are supported."
-            );
-        }
-        for (size_t i = 0; i < n; ++i) {
+
+        // 第 9 个及之后的参数按照 RISC-V ABI 放到调用者栈上。
+        int extraArgBytes = n > 8 ? static_cast<int>((n - 8) * 4) : 0;
+        fctx->maxOutgoingArgBytes = std::max(fctx->maxOutgoingArgBytes, extraArgBytes);
+
+        // Step 2a: 前 8 个参数进入 a0~a7。
+        size_t registerArgs = std::min<size_t>(n, 8);
+        for (size_t i = 0; i < registerArgs; ++i) {
             irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(argSlots[i]));
             std::string reg = "a" + std::to_string(i);
             irFunc.instrs.emplace_back(IRInstrType::MV, reg, "t0");
         }
+
+        // Step 2b: 第 9+ 个参数进入当前函数预留的 outgoing 参数区。
+        for (size_t i = 8; i < n; ++i) {
+            irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(argSlots[i]));
+            int argOffset = static_cast<int>((i - 8) * 4);
+            irFunc.instrs.emplace_back(IRInstrType::STORE_ARG, "", "t0", std::to_string(argOffset));
+        }
+
         // Step 3: call，返回值 a0 → t0
         irFunc.instrs.emplace_back(IRInstrType::CALL, "", call->name);
         irFunc.instrs.emplace_back(IRInstrType::MV, "t0", "a0");
@@ -174,7 +193,7 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
         buildExpr(un->operand, irFunc);
         if (un->op == "-") {
             irFunc.instrs.emplace_back(IRInstrType::LI, "t1", "0");
-            irFunc.instrs.emplace_back(IRInstrType::SUB, "t0", "t1", "t0");  // 0 - t0
+            irFunc.instrs.emplace_back(IRInstrType::SUB, "t0", "t1", "t0");
         } else if (un->op == "!") {
             irFunc.instrs.emplace_back(IRInstrType::SEQZ, "t0", "t0");
         }
@@ -184,38 +203,36 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
 
     // ------- 二元表达式 -------
     if (auto bin = std::dynamic_pointer_cast<BinaryExpr>(expr)) {
-        // 逻辑 && / || (短路求值) —— 结果必须是 0 或 1 (C 语言规范)
+        // 逻辑 && / ||：短路求值，并把结果规范化为 0/1。
         if (bin->op == "&&" || bin->op == "||") {
             std::string shortLabel = newLabel();
             std::string endLabel = newLabel();
             buildExpr(bin->left, irFunc);
+
             if (bin->op == "&&") {
-                // 左 == 0 → 结果就是 0，跳过右值计算
                 irFunc.instrs.emplace_back(IRInstrType::BRANCH_ZERO, "", "t0", "", shortLabel);
-                buildExpr(bin->right, irFunc);          // 结果 t0 = right 值，可能任意
-                irFunc.instrs.emplace_back(IRInstrType::SNEZ, "t0", "t0");   // 规范化为 0/1
+                buildExpr(bin->right, irFunc);
+                irFunc.instrs.emplace_back(IRInstrType::SNEZ, "t0", "t0");
                 irFunc.instrs.emplace_back(IRInstrType::JUMP, "", "", "", endLabel);
                 irFunc.instrs.emplace_back(IRInstrType::LABEL, "", "", "", shortLabel);
-                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", "0");      // 短路情况：固定 0
+                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", "0");
                 irFunc.instrs.emplace_back(IRInstrType::LABEL, "", "", "", endLabel);
-            } else { // ||
-                // 左 != 0 → 结果就是 1，跳过右值计算
+            } else {
                 irFunc.instrs.emplace_back(IRInstrType::BRANCH_NONZERO, "", "t0", "", shortLabel);
-                buildExpr(bin->right, irFunc);          // 结果 t0 = right 值，可能任意
-                irFunc.instrs.emplace_back(IRInstrType::SNEZ, "t0", "t0");   // 规范化为 0/1
+                buildExpr(bin->right, irFunc);
+                irFunc.instrs.emplace_back(IRInstrType::SNEZ, "t0", "t0");
                 irFunc.instrs.emplace_back(IRInstrType::JUMP, "", "", "", endLabel);
                 irFunc.instrs.emplace_back(IRInstrType::LABEL, "", "", "", shortLabel);
-                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", "1");      // 短路情况：固定 1
+                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", "1");
                 irFunc.instrs.emplace_back(IRInstrType::LABEL, "", "", "", endLabel);
             }
             return;
         }
 
-        // 其他二元运算：左边结果先 spill 到栈槽 → 算右边 → 左边 reload 到 t1，右边在 t0 → 运算写回 t0
+        // 其他二元运算：左边先 spill，算右边，再把左边 reload 到 t1。
         IRInstrType opType = IRInstrType::ADD;
         bool isArith = (bin->op == "+" || bin->op == "-" || bin->op == "*" ||
                         bin->op == "/" || bin->op == "%");
-        bool isCmp = !isArith;
 
         if (bin->op == "+") opType = IRInstrType::ADD;
         else if (bin->op == "-") opType = IRInstrType::SUB;
@@ -223,17 +240,15 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
         else if (bin->op == "/") opType = IRInstrType::DIV;
         else if (bin->op == "%") opType = IRInstrType::REM;
 
-        buildExpr(bin->left, irFunc);          // 左值 → t0
+        buildExpr(bin->left, irFunc);
         int leftSlot = allocSlot();
         irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(leftSlot));
+        buildExpr(bin->right, irFunc);
 
-        buildExpr(bin->right, irFunc);         // 右值 → t0  (期间函数调用会破坏所有临时寄存器)
-
-        // 左值 reload 到 t1
         irFunc.instrs.emplace_back(IRInstrType::LOAD, "t1", std::to_string(leftSlot));
 
         if (isArith) {
-            irFunc.instrs.emplace_back(opType, "t0", "t1", "t0");   // t0 = t1 OP t0 (左 OP 右)
+            irFunc.instrs.emplace_back(opType, "t0", "t1", "t0");
             return;
         }
 
@@ -262,7 +277,6 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
 }
 
 // =============================== 语句生成 ===============================
-
 void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
     if (!stmt) return;
 
@@ -286,10 +300,14 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // 赋值语句
+    // 赋值语句：同样必须局部优先，避免局部变量遮蔽全局变量时写错目标。
     if (auto assign = std::dynamic_pointer_cast<AssignStmt>(stmt)) {
         buildExpr(assign->value, irFunc);
-        if (isGlobalVar(assign->name)) {
+
+        int localOffset = 0;
+        if (tryLookupVar(assign->name, localOffset)) {
+            irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(localOffset));
+        } else if (isGlobalVar(assign->name)) {
             irFunc.instrs.emplace_back(IRInstrType::STORE_GLOBAL, "", assign->name, "t0");
         } else {
             int offset = getVarOffset(assign->name);
@@ -298,7 +316,7 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
         return;
     }
 
-    // return 语句：把值送入 a0 后跳统一返回标签（尾声在那里，保证栈帧恢复）
+    // return 语句：把值送入 a0 后跳统一返回标签
     if (auto ret = std::dynamic_pointer_cast<ReturnStmt>(stmt)) {
         if (ret->value) {
             buildExpr(ret->value, irFunc);
@@ -361,7 +379,6 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
 }
 
 // =============================== 总入口 ===============================
-
 IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checker) {
     currentChecker = checker;
     IRProgram program;
@@ -370,6 +387,10 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
 
     globalNames.clear();
     functionParamCounts.clear();
+
+    // 标签只在整个编译单元开始时清零，而不是每个函数清零。
+    // 否则不同函数都会生成 .L0/.L1，汇编器会遇到重复符号。
+    labelCounter = 0;
 
     // 第一遍：收集全局变量、常量、函数信息
     for (const auto& unit : compUnit->units) {
@@ -391,7 +412,7 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
             globalNames.insert(varDecl->name);
         }
         if (auto funcDef = std::dynamic_pointer_cast<FunctionDef>(unit)) {
-            functionParamCounts[funcDef->name] = funcDef->params.size();
+            functionParamCounts[funcDef->name] = static_cast<int>(funcDef->params.size());
         }
     }
 
@@ -402,31 +423,29 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
 
         IRFunction irFunc;
         irFunc.name = funcDef->name;
-        irFunc.paramCount = (int)funcDef->params.size();
+        irFunc.paramCount = static_cast<int>(funcDef->params.size());
         irFunc.isVoid = (funcDef->returnType == ValueType::Void);
 
-        // 构造新的函数级上下文
         FuncContext ctx;
         fctx = &ctx;
-        labelCounter = 0;
         loopStack.clear();
         currentReturnLabel = ".ret_" + funcDef->name;
 
         // 进入函数最外层作用域（参数 + 函数体共用）
         scopePush();
 
-        // 参数：登记 + 从 aN 寄存器存入各自栈槽（≥9 个参数先不支持）
-        if (funcDef->params.size() > 8) {
-            throw std::runtime_error(
-                "Function '" + funcDef->name + "' has " +
-                std::to_string(funcDef->params.size()) +
-                " parameters; currently only up to 8 parameters are supported."
-            );
-        }
+        // 参数：前 8 个来自 a0~a7；第 9+ 个来自调用者栈。
         for (size_t i = 0; i < funcDef->params.size(); ++i) {
             int off = declareVar(funcDef->params[i].name);
-            std::string reg = "a" + std::to_string(i);
-            irFunc.instrs.emplace_back(IRInstrType::MV, "t0", reg);
+
+            if (i < 8) {
+                std::string reg = "a" + std::to_string(i);
+                irFunc.instrs.emplace_back(IRInstrType::MV, "t0", reg);
+            } else {
+                int incomingOffset = static_cast<int>((i - 8) * 4);
+                irFunc.instrs.emplace_back(IRInstrType::LOAD_ARG, "t0", std::to_string(incomingOffset));
+            }
+
             irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(off));
         }
 
@@ -434,14 +453,14 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
             buildStmt(funcDef->body, irFunc);
         }
 
-        // 退出最外层作用域
         scopePop();
 
-        // 放统一返回标签：函数体内任何 return 跳到这里，然后自然掉到尾声
+        // 统一返回标签
         irFunc.instrs.emplace_back(IRInstrType::LABEL, "", "", "", currentReturnLabel);
 
-        // 保存局部区域总字节数，供后端据此设置栈帧
+        // 保存函数布局信息，后端统一决定最终物理偏移。
         irFunc.localSize = ctx.nextOffset;
+        irFunc.outgoingArgSize = ctx.maxOutgoingArgBytes;
 
         fctx = nullptr;
         program.functions.push_back(std::move(irFunc));
