@@ -12,7 +12,7 @@ namespace toycc {
 // 若超过求值预算或遇到当前求值器不支持的情况，则返回 nullopt，调用方应回退到普通 IR/后端。
 std::optional<std::int32_t> tryEvaluateMainAtCompileTime(
     const ASTNodePtr& root,
-    std::uint64_t stepBudget = 200000000ULL);
+    std::uint64_t stepBudget = 20000ULL);
 
 // 输出只返回一个常量的最小 RISC-V 程序。
 void emitConstantMain(std::ostream& out, std::int32_t value);

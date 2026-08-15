@@ -34,7 +34,7 @@ int main(int argc, char* argv[]) {
         if (enableOpt) {
             // ToyC 没有 I/O/运行时输入。优先尝试整程序编译期求值；成功时直接输出
             // 等价的常量 main，运行期开销接近最小。若预算耗尽，则自动回退普通后端。
-            if (auto value = toycc::tryEvaluateMainAtCompileTime(ast); value.has_value()) {
+            if (auto value = toycc::tryEvaluateMainAtCompileTime(ast, 20000ULL); value.has_value()) {
                 toycc::emitConstantMain(std::cout, *value);
                 return 0;
             }
