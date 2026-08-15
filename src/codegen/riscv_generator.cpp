@@ -47,6 +47,21 @@ bool RiscvGenerator::isCoreBinaryOp(IRInstrType type) {
            type == IRInstrType::REM || type == IRInstrType::SLT;
 }
 
+// A spill-store may only be removed when the matching immediate reload is its
+// last use.  IR optimization can make an originally one-shot temporary slot
+// visible again later (e.g. copy/CSE propagation).  In that case omitting the
+// physical store would leave the later LOAD reading stale stack contents.
+static bool hasAdditionalLoadOfSlot(const std::vector<IRInstr>& instrs,
+                                    const std::string& slot,
+                                    size_t immediateLoadIndex) {
+    for (size_t j = immediateLoadIndex + 1; j < instrs.size(); ++j) {
+        if (instrs[j].type == IRInstrType::LOAD && instrs[j].src1 == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<std::pair<int, std::string>>
 RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
     std::unordered_map<std::string, size_t> labelIndex;
@@ -71,7 +86,9 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         const bool simpleRhs = rhs.dest == "t0" &&
             (rhs.type == IRInstrType::LI || rhs.type == IRInstrType::LOAD ||
              rhs.type == IRInstrType::LOAD_ARG || rhs.type == IRInstrType::LOAD_GLOBAL);
-        if (simpleRhs) eliminatedSpills[std::stoi(st.src2)] = true;
+        if (simpleRhs && !hasAdditionalLoadOfSlot(func.instrs, st.src2, i + 2)) {
+            eliminatedSpills[std::stoi(st.src2)] = true;
+        }
     }
 
     std::vector<int> loopWeight(func.instrs.size(), 1);
@@ -217,6 +234,9 @@ bool RiscvGenerator::tryEmitSpillPeephole(const std::vector<IRInstr>& v, size_t&
     if (!isCoreBinaryOp(op.type) || op.dest != "t0") return false;
     if (!((op.src1 == "t1" && op.src2 == "t0") ||
           (op.src1 == "t0" && op.src2 == "t1"))) return false;
+    // The store is elided by this peephole, so the immediate reload must be
+    // the final LOAD of that slot in the optimized IR.
+    if (hasAdditionalLoadOfSlot(v, st.src2, i + 2)) return false;
 
     const bool simpleRhs = rhs.dest == "t0" &&
         (rhs.type == IRInstrType::LI || rhs.type == IRInstrType::LOAD ||
@@ -347,6 +367,7 @@ bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, si
     if (lhs.type != IRInstrType::LOAD || lhs.dest != "t0") return false;
     if (spill.type != IRInstrType::STORE || spill.src1 != "t0") return false;
     if (reload.type != IRInstrType::LOAD || reload.dest != "t1" || reload.src1 != spill.src2) return false;
+    if (hasAdditionalLoadOfSlot(v, spill.src2, i + 3)) return false;
     if (!isCoreBinaryOp(op.type) || op.dest != "t0" || op.src1 != "t1" || op.src2 != "t0") return false;
     if (store.type != IRInstrType::STORE || store.src1 != "t0") return false;
 
@@ -698,6 +719,7 @@ bool RiscvGenerator::tryEmitCompareBranch(const std::vector<IRInstr>& v, size_t&
     if (lhs.type != IRInstrType::LOAD || lhs.dest != "t0") return false;
     if (spill.type != IRInstrType::STORE || spill.src1 != "t0") return false;
     if (reload.type != IRInstrType::LOAD || reload.dest != "t1" || reload.src1 != spill.src2) return false;
+    if (hasAdditionalLoadOfSlot(v, spill.src2, i + 3)) return false;
 
     std::string lhsReg = promotedRegForSlot(std::stoi(lhs.src1));
     if (lhsReg.empty()) return false;
