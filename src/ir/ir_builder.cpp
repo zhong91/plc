@@ -13,6 +13,7 @@ namespace toycc {
 
 static int labelCounter = 0;
 static std::set<std::string> globalNames;
+static std::unordered_map<std::string, int32_t> globalConstValues;
 static std::map<std::string, int> functionParamCounts;
 
 // 循环栈：用于 break/continue 的标签
@@ -28,6 +29,9 @@ struct FuncContext {
     // 作用域栈：每个作用域一个 name -> offset 映射
     // 进入 Block push，离开 Block pop；变量查找从顶查到底，天然支持同名遮蔽
     std::vector<std::unordered_map<std::string, int>> scopes;
+    // Same-depth compile-time constants. A non-const declaration in scopes shadows
+    // an outer constant, so lookup must consult both structures together.
+    std::vector<std::unordered_map<std::string, int32_t>> constScopes;
 
     // 下一个可用“逻辑局部偏移”（局部变量 + 参数副本 + 临时 spill 共用）
     int nextOffset = 0;
@@ -48,11 +52,13 @@ static int allocSlot() {
 // 进入一个作用域
 static void scopePush() {
     fctx->scopes.emplace_back();
+    fctx->constScopes.emplace_back();
 }
 
 // 退出一个作用域（槽位暂不重用，保证实现简单且安全）
 static void scopePop() {
     fctx->scopes.pop_back();
+    fctx->constScopes.pop_back();
 }
 
 // 在当前（最内）作用域声明一个变量，分配新栈槽
@@ -60,6 +66,25 @@ static int declareVar(const std::string& name) {
     int off = allocSlot();
     fctx->scopes.back().emplace(name, off);
     return off;
+}
+
+static int declareConst(const std::string& name, int32_t value) {
+    int off = declareVar(name);
+    fctx->constScopes.back()[name] = value;
+    return off;
+}
+
+static bool tryLookupLocalConst(const std::string& name, int32_t& value) {
+    if (!fctx) return false;
+    for (size_t depth = fctx->scopes.size(); depth-- > 0;) {
+        auto decl = fctx->scopes[depth].find(name);
+        if (decl == fctx->scopes[depth].end()) continue;
+        auto c = fctx->constScopes[depth].find(name);
+        if (c == fctx->constScopes[depth].end()) return false;
+        value = c->second;
+        return true;
+    }
+    return false;
 }
 
 // 尝试从内到外查找局部变量。返回 true 表示局部/参数存在。
@@ -120,6 +145,43 @@ int getConstValue(const std::string& name) {
     throw std::runtime_error("Cannot get const value in test mode");
 }
 
+static int32_t evalConstExprForIR(const ExprPtr& expr) {
+    if (auto num = std::dynamic_pointer_cast<NumberLiteral>(expr)) {
+        return static_cast<int32_t>(num->value);
+    }
+    if (auto var = std::dynamic_pointer_cast<Variable>(expr)) {
+        int32_t v = 0;
+        if (tryLookupLocalConst(var->name, v)) return v;
+        auto g = globalConstValues.find(var->name);
+        if (g != globalConstValues.end()) return g->second;
+        throw std::runtime_error("Non-constant identifier '" + var->name + "' in const initializer");
+    }
+    if (auto un = std::dynamic_pointer_cast<UnaryExpr>(expr)) {
+        int32_t a = evalConstExprForIR(un->operand);
+        if (un->op == "+") return a;
+        if (un->op == "-") return static_cast<int32_t>(0u - static_cast<uint32_t>(a));
+        if (un->op == "!") return a == 0 ? 1 : 0;
+    }
+    if (auto bin = std::dynamic_pointer_cast<BinaryExpr>(expr)) {
+        int32_t a = evalConstExprForIR(bin->left);
+        if (bin->op == "&&") return a == 0 ? 0 : (evalConstExprForIR(bin->right) != 0 ? 1 : 0);
+        if (bin->op == "||") return a != 0 ? 1 : (evalConstExprForIR(bin->right) != 0 ? 1 : 0);
+        int32_t b = evalConstExprForIR(bin->right);
+        if (bin->op == "+") return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(b));
+        if (bin->op == "-") return static_cast<int32_t>(static_cast<uint32_t>(a) - static_cast<uint32_t>(b));
+        if (bin->op == "*") return static_cast<int32_t>(static_cast<uint32_t>(a) * static_cast<uint32_t>(b));
+        if (bin->op == "/") return static_cast<int32_t>(a / b);
+        if (bin->op == "%") return static_cast<int32_t>(a % b);
+        if (bin->op == "<") return a < b ? 1 : 0;
+        if (bin->op == ">") return a > b ? 1 : 0;
+        if (bin->op == "<=") return a <= b ? 1 : 0;
+        if (bin->op == ">=") return a >= b ? 1 : 0;
+        if (bin->op == "==") return a == b ? 1 : 0;
+        if (bin->op == "!=") return a != b ? 1 : 0;
+    }
+    throw std::runtime_error("Unsupported constant expression in IR builder");
+}
+
 // =============================== 表达式生成 ===============================
 // 所有表达式约定：计算结果存在 t0 中。需要跨子表达式保存的值放入栈槽。
 void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
@@ -135,12 +197,15 @@ void buildExpr(const ExprPtr& expr, IRFunction& irFunc) {
         // 不能覆盖当前作用域中的局部变量/参数。
         int localOffset = 0;
         if (tryLookupVar(var->name, localOffset)) {
-            irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(localOffset));
+            int32_t constValue = 0;
+            if (tryLookupLocalConst(var->name, constValue))
+                irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(constValue));
+            else
+                irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(localOffset));
+        } else if (auto c = globalConstValues.find(var->name); c != globalConstValues.end()) {
+            irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(c->second));
         } else if (isGlobalVar(var->name)) {
             irFunc.instrs.emplace_back(IRInstrType::LOAD_GLOBAL, "t0", var->name);
-        } else if (currentChecker && isConstantVar(var->name)) {
-            int val = getConstValue(var->name);
-            irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(val));
         } else {
             int offset = getVarOffset(var->name); // 保留原有错误信息
             irFunc.instrs.emplace_back(IRInstrType::LOAD, "t0", std::to_string(offset));
@@ -292,10 +357,18 @@ void buildStmt(const StmtPtr& stmt, IRFunction& irFunc) {
 
     // 变量声明：在当前作用域登记，分配新槽，写入初始化值
     if (auto varDecl = std::dynamic_pointer_cast<VarDeclStmt>(stmt)) {
-        int offset = declareVar(varDecl->name);
-        if (varDecl->init) {
-            buildExpr(varDecl->init, irFunc);
+        int offset = 0;
+        if (varDecl->isConst) {
+            int32_t value = evalConstExprForIR(varDecl->init);
+            offset = declareConst(varDecl->name, value);
+            irFunc.instrs.emplace_back(IRInstrType::LI, "t0", std::to_string(value));
             irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(offset));
+        } else {
+            offset = declareVar(varDecl->name);
+            if (varDecl->init) {
+                buildExpr(varDecl->init, irFunc);
+                irFunc.instrs.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(offset));
+            }
         }
         return;
     }
@@ -386,6 +459,7 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
     if (!compUnit) throw std::runtime_error("Root is not CompUnit");
 
     globalNames.clear();
+    globalConstValues.clear();
     functionParamCounts.clear();
 
     // 标签只在整个编译单元开始时清零，而不是每个函数清零。
@@ -410,6 +484,7 @@ IRProgram IRBuilder::build(const ASTNodePtr& root, const SemanticChecker* checke
             }
             program.globalVars.push_back({varDecl->name, initValue});
             globalNames.insert(varDecl->name);
+            if (varDecl->isConst) globalConstValues[varDecl->name] = static_cast<int32_t>(initValue);
         }
         if (auto funcDef = std::dynamic_pointer_cast<FunctionDef>(unit)) {
             functionParamCounts[funcDef->name] = static_cast<int>(funcDef->params.size());

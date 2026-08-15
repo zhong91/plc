@@ -17,6 +17,12 @@ add_library(toycc_frontend
     src/semantic/semantic_checker.cpp
     src/ir/ir_builder.cpp
     src/codegen/riscv_generator.cpp
+    src/codegen/riscv_generator_updates.cpp
+    src/codegen/riscv_generator_branches.cpp
+    src/codegen/riscv_generator_values.cpp
+    src/codegen/riscv_generator_values_mulacc.cpp
+    src/codegen/riscv_generator_values_immediate.cpp
+    src/codegen/riscv_generator_generate.cpp
     src/opt/compile_time_evaluator.cpp
     src/opt/ir_compile_time_evaluator.cpp
     src/opt/ir_optimizer.cpp
@@ -40,6 +46,21 @@ target_link_libraries(compiler PRIVATE
 if(MSVC)
     target_compile_options(toycc_frontend PRIVATE /O2)
     target_compile_options(compiler PRIVATE /O2)
+
+    # MSVC 14.43 can hit C1001 while optimizing the large RISC-V backend
+    # translation unit.  Keep the performance-critical compile-time evaluator
+    # at /O2, but compile only the code generator itself without host
+    # optimization.  This does not change the quality of generated RISC-V.
+    set_source_files_properties(
+        src/codegen/riscv_generator.cpp
+    src/codegen/riscv_generator_updates.cpp
+    src/codegen/riscv_generator_branches.cpp
+    src/codegen/riscv_generator_values.cpp
+    src/codegen/riscv_generator_values_mulacc.cpp
+    src/codegen/riscv_generator_values_immediate.cpp
+    src/codegen/riscv_generator_generate.cpp
+        PROPERTIES COMPILE_OPTIONS "/Od;/Ob0"
+    )
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(toycc_frontend PRIVATE -O3 -DNDEBUG)
     target_compile_options(compiler PRIVATE -O3 -DNDEBUG)
