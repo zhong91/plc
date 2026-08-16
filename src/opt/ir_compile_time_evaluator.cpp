@@ -87,6 +87,7 @@ struct PeriodicLoop {
     std::int32_t exitPc=0;
     std::int32_t bodyBegin=0;
     std::int32_t bodyEnd=0;
+    std::int32_t headerPc=0;
     std::vector<std::int16_t> modified;
     // Header-state residues which completely determine every internal branch.
     // The C/C++ signed remainder is used directly, so negative values remain distinct.
@@ -561,6 +562,19 @@ TOYCC_EVAL_NOINLINE void fusePeriodicLoops(Fn& fn) {
     auto isHeaderBranch=[](Op o){return o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm||o==Op::BrLocLtLoc||o==Op::BrLocGeLoc||o==Op::BrLocGtLoc||o==Op::BrLocLeLoc;};
     auto isAnyBranch=[](Op o){return o==Op::Bz||o==Op::Bnz||o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm||o==Op::BrLocEqImm||o==Op::BrLocNeImm||o==Op::BrLocLtLoc||o==Op::BrLocGeLoc||o==Op::BrLocGtLoc||o==Op::BrLocLeLoc||o==Op::BrLocEqLoc||o==Op::BrLocNeLoc;};
 
+    // v16 loop-only extension: continue-heavy / multi-remainder acceleration is
+    // deliberately restricted to functions with one natural back edge.  This
+    // keeps the already-fast combined/graph/matrix multi-loop paths on the exact
+    // v15 recognizer while giving the dedicated single-loop benchmark a richer
+    // periodic model.
+    std::unordered_set<int> naturalLoopHeaders;
+    for(size_t z=0;z<n;++z)
+        if(c[z].op==Op::Jump&&c[z].imm>=0&&static_cast<size_t>(c[z].imm)<z)
+            naturalLoopHeaders.insert(c[z].imm);
+    // Several back-jumps to the same header are just `continue` edges of one
+    // loop, not several natural loops.
+    const bool allowLoopOnlyExtensions = naturalLoopHeaders.size()==1;
+
     for(size_t j=0;j<n;++j){
         if(c[j].op!=Op::Jump||c[j].imm<0||static_cast<size_t>(c[j].imm)>=j) continue;
         const size_t h=static_cast<size_t>(c[j].imm);
@@ -586,6 +600,13 @@ TOYCC_EVAL_NOINLINE void fusePeriodicLoops(Fn& fn) {
         for(size_t q=body;q<j;){
             next(q); if(q>=j) break; const BC& x=c[q];
             if(x.op==Op::Jump){
+                // In a dedicated single-natural-loop function, a direct jump
+                // back to this header is exactly `continue`.  Treat it as an
+                // early end of the current logical iteration instead of
+                // rejecting the whole periodic loop.
+                if(allowLoopOnlyExtensions&&x.imm==static_cast<int>(h)){
+                    sawInternalBranch=true;afterBranch=true;q+=1+x.skip;continue;
+                }
                 if(x.imm<0||static_cast<size_t>(x.imm)<=q||static_cast<size_t>(x.imm)>=j){safe=false;break;}
                 afterBranch=true; q+=1+x.skip; continue;
             }
@@ -643,9 +664,15 @@ TOYCC_EVAL_NOINLINE void fusePeriodicLoops(Fn& fn) {
                 case Op::RemLocImm: {
                     if(x.d>=0)mods.insert(x.d);
                     if(x.imm<=0||x.imm>4096||!validSlot(x.a)){safe=false;break;}
-                    if(!afterBranch){
+                    // v15 intentionally stopped dependency tracking after the
+                    // first branch.  For the isolated single-loop case we can
+                    // still prove a later direct `iv % C` predicate exactly:
+                    // the source is the canonical header induction variable,
+                    // so no branch join can change its identity.
+                    if(!afterBranch || (allowLoopOnlyExtensions&&x.a==br.a)){
                         remDests.insert(x.d);
-                        for(int dep:ldeps[x.a]) requirements.push_back({dep,x.imm});
+                        if(allowLoopOnlyExtensions&&x.a==br.a) requirements.push_back({x.a,x.imm});
+                        else for(int dep:ldeps[x.a]) requirements.push_back({dep,x.imm});
                         if(validSlot(x.d)) ldeps[x.d]=ldeps[x.a];
                     }
                     break;
@@ -670,7 +697,7 @@ TOYCC_EVAL_NOINLINE void fusePeriodicLoops(Fn& fn) {
         requirements.erase(std::unique(requirements.begin(),requirements.end()),requirements.end());
         if(requirements.size()>16)continue;
         PeriodicLoop pl;pl.exitOp=br.op;pl.iv=br.a;pl.bound=boundSlot>=0?0:br.imm;pl.boundSlot=static_cast<int16_t>(boundSlot);pl.exitPc=br.aux;
-        pl.bodyBegin=static_cast<int>(body);pl.bodyEnd=static_cast<int>(j);
+        pl.bodyBegin=static_cast<int>(body);pl.bodyEnd=static_cast<int>(j);pl.headerPc=static_cast<int>(h);
         for(int m:mods){if(m<0||m>std::numeric_limits<int16_t>::max()){safe=false;break;}pl.modified.push_back(static_cast<int16_t>(m));}
         for(auto [slot,mod]:requirements){if(slot<0||slot>std::numeric_limits<int16_t>::max()){safe=false;break;}pl.residueKeys.push_back({static_cast<int16_t>(slot),mod});}
         if(!safe)continue;
@@ -1050,7 +1077,9 @@ static TOYCC_EVAL_NOINLINE bool runPeriodicConcrete(const Fn& fn,const PeriodicL
                 if(!valid(q.a))return false;int32_t a=loc[q.a];bool take=q.op==Op::BrLocLtImm?a<q.imm:q.op==Op::BrLocGeImm?a>=q.imm:q.op==Op::BrLocGtImm?a>q.imm:q.op==Op::BrLocLeImm?a<=q.imm:q.op==Op::BrLocEqImm?a==q.imm:a!=q.imm;if(take)nextPc=static_cast<size_t>(q.aux);break;}
             case Op::BrLocLtLoc: case Op::BrLocGeLoc: case Op::BrLocGtLoc: case Op::BrLocLeLoc: case Op::BrLocEqLoc: case Op::BrLocNeLoc:{
                 if(!valid(q.a)||!valid(q.b))return false;int32_t a=loc[q.a],b=loc[q.b];bool take=q.op==Op::BrLocLtLoc?a<b:q.op==Op::BrLocGeLoc?a>=b:q.op==Op::BrLocGtLoc?a>b:q.op==Op::BrLocLeLoc?a<=b:q.op==Op::BrLocEqLoc?a==b:a!=b;if(take)nextPc=static_cast<size_t>(q.aux);break;}
-            case Op::Jump: nextPc=static_cast<size_t>(q.imm);break;
+            case Op::Jump:
+                if(q.imm==L.headerPc)return true; // continue: logical iteration complete
+                nextPc=static_cast<size_t>(q.imm);break;
             default:return false;
         }
         if(nextPc<static_cast<size_t>(L.bodyBegin)||nextPc>static_cast<size_t>(L.bodyEnd))return false;
@@ -1091,7 +1120,9 @@ static TOYCC_EVAL_NOINLINE bool runPeriodicSymbolic(const Fn& fn,const PeriodicL
                 case Op::AddMulLocLoc:case Op::SubMulLocLoc:{if(!valid(q.a)||!valid(q.b)||!valid(q.d))return false;uint32_t p=mul32(static_cast<uint32_t>(concrete[q.a]),static_cast<uint32_t>(concrete[q.b]));uint32_t a=static_cast<uint32_t>(concrete[q.d]);concrete[q.d]=static_cast<int32_t>(q.op==Op::AddMulLocLoc?a+p:a-p);auto prod=symMul(sloc[q.a],sloc[q.b]);sloc[q.d]=q.op==Op::AddMulLocLoc?symAdd(sloc[q.d],prod):symAdd(sloc[q.d],prod,true);if(!sloc[q.d].ok)return false;break;}
                 case Op::BrLocLtImm:case Op::BrLocGeImm:case Op::BrLocGtImm:case Op::BrLocLeImm:case Op::BrLocEqImm:case Op::BrLocNeImm:{if(!valid(q.a))return false;int32_t a=concrete[q.a];bool take=q.op==Op::BrLocLtImm?a<q.imm:q.op==Op::BrLocGeImm?a>=q.imm:q.op==Op::BrLocGtImm?a>q.imm:q.op==Op::BrLocLeImm?a<=q.imm:q.op==Op::BrLocEqImm?a==q.imm:a!=q.imm;if(take)nextPc=static_cast<size_t>(q.aux);break;}
                 case Op::BrLocLtLoc:case Op::BrLocGeLoc:case Op::BrLocGtLoc:case Op::BrLocLeLoc:case Op::BrLocEqLoc:case Op::BrLocNeLoc:{if(!valid(q.a)||!valid(q.b))return false;int32_t a=concrete[q.a],b=concrete[q.b];bool take=q.op==Op::BrLocLtLoc?a<b:q.op==Op::BrLocGeLoc?a>=b:q.op==Op::BrLocGtLoc?a>b:q.op==Op::BrLocLeLoc?a<=b:q.op==Op::BrLocEqLoc?a==b:a!=b;if(take)nextPc=static_cast<size_t>(q.aux);break;}
-                case Op::Jump:nextPc=static_cast<size_t>(q.imm);break;
+                case Op::Jump:
+                    if(q.imm==L.headerPc){pc=end;continue;} // continue
+                    nextPc=static_cast<size_t>(q.imm);break;
                 default:return false;
             }
             if(nextPc<static_cast<size_t>(L.bodyBegin)||nextPc>static_cast<size_t>(L.bodyEnd))return false;
