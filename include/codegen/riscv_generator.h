@@ -36,6 +36,7 @@ private:
     bool tryEmitDirectValueBranch(const std::vector<IRInstr>& instrs, size_t& index);
     bool tryEmitImmediateBinaryValue(const std::vector<IRInstr>& instrs, size_t& index);
     bool tryEmitRegisterBinaryValue(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitPromotedOperandOp(const std::vector<IRInstr>& instrs, size_t& index);
     bool tryEmitMulAccumulateUpdate(const std::vector<IRInstr>& instrs, size_t& index);
     bool emitSimpleValueToReg(const IRInstr& instr, const std::string& dest);
     std::string promotedRegForSlot(int logicalOffset) const;

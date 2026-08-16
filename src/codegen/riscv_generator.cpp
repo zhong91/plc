@@ -116,12 +116,39 @@ bool RiscvGenerator::isCoreBinaryOp(IRInstrType type) {
 // visible again later (e.g. copy/CSE propagation).  In that case omitting the
 // physical store would leave the later LOAD reading stale stack contents.
 static bool hasAdditionalLoadOfSlot(const std::vector<IRInstr>& instrs,
-                                    const std::string& slot,
-                                    size_t immediateLoadIndex) {
-    for (size_t j = immediateLoadIndex + 1; j < instrs.size(); ++j) {
-        if (instrs[j].type == IRInstrType::LOAD && instrs[j].src1 == slot) {
-            return true;
+                                  const std::string& slot,
+                                  size_t immediateLoadIndex) {
+    // Follow real CFG successors, not just textual order. A value spilled inside
+    // a loop can be loaded on the next iteration through a backward edge even
+    // when there is no later textual LOAD. Stop a path as soon as the slot is
+    // redefined; that STORE starts a new value version.
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t k = 0; k < instrs.size(); ++k) {
+        if (instrs[k].type == IRInstrType::LABEL) labels[instrs[k].label] = k;
+    }
+    std::vector<unsigned char> seen(instrs.size(), 0);
+    std::vector<size_t> work;
+    if (immediateLoadIndex + 1 < instrs.size()) work.push_back(immediateLoadIndex + 1);
+    while (!work.empty()) {
+        const size_t j = work.back(); work.pop_back();
+        if (j >= instrs.size() || seen[j]) continue;
+        seen[j] = 1;
+        const auto& in = instrs[j];
+        if (in.type == IRInstrType::LOAD && in.src1 == slot) return true;
+        if (in.type == IRInstrType::STORE && in.src2 == slot) continue;
+        if (in.type == IRInstrType::RET) continue;
+        if (in.type == IRInstrType::JUMP) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            continue;
         }
+        if (in.type == IRInstrType::BRANCH_ZERO || in.type == IRInstrType::BRANCH_NONZERO) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            if (j + 1 < instrs.size()) work.push_back(j + 1);
+            continue;
+        }
+        if (j + 1 < instrs.size()) work.push_back(j + 1);
     }
     return false;
 }
@@ -332,8 +359,11 @@ bool RiscvGenerator::tryEmitSpillPeephole(const std::vector<IRInstr>& v, size_t&
     if (st.type != IRInstrType::STORE || st.src1 != "t0") return false;
     if (ld.type != IRInstrType::LOAD || ld.dest != "t1" || ld.src1 != st.src2) return false;
     if (!isCoreBinaryOp(op.type) || op.dest != "t0") return false;
-    if (!((op.src1 == "t1" && op.src2 == "t0") ||
-          (op.src1 == "t0" && op.src2 == "t1"))) return false;
+
+    const bool spillLeft = op.src1 == "t1" && op.src2 == "t0";
+    const bool rhsLeft = op.src1 == "t0" && op.src2 == "t1";
+    if (!spillLeft && !rhsLeft) return false;
+
     // The store is elided by this peephole, so the immediate reload must be
     // the final LOAD of that slot in the optimized IR.
     if (hasAdditionalLoadOfSlot(v, st.src2, i + 2)) return false;
@@ -343,29 +373,153 @@ bool RiscvGenerator::tryEmitSpillPeephole(const std::vector<IRInstr>& v, size_t&
          rhs.type == IRInstrType::LOAD_ARG || rhs.type == IRInstrType::LOAD_GLOBAL);
     if (!simpleRhs) return false;
 
-    if (rhs.type == IRInstrType::LI) {
-        const auto imm=static_cast<std::int32_t>(std::stoll(rhs.src1));
-        if(op.src1=="t1"&&op.src2=="t0"&&op.type==IRInstrType::DIV){emitSignedDivConst("t0","t0",imm);i+=3;return true;}
-        if(op.src1=="t1"&&op.src2=="t0"&&op.type==IRInstrType::REM){emitSignedRemConst("t0","t0",imm);i+=3;return true;}
-        emitLine("    li t1, " + rhs.src1);
-        IRInstr mapped = op;
-        auto mapSrc = [](const std::string& s) {
-            if (s == "t1") return std::string("t0");
-            if (s == "t0") return std::string("t1");
-            return s;
-        };
-        mapped.src1 = mapSrc(op.src1);
-        mapped.src2 = mapSrc(op.src2);
-        emitInstr(mapped);
-    } else {
-        emitLine("    mv t1, t0");
-        emitInstr(rhs);
-        emitInstr(op);
+    // At entry t0 still contains the value that would have been spilled.
+    // If the RHS is itself a promoted local, operate on it directly instead of
+    // shuffling the old t0 through t1 and reloading the RHS through t0.
+    if (rhs.type == IRInstrType::LOAD) {
+        const int rhsOff = std::stoi(rhs.src1);
+        const std::string rhsReg = promotedRegForSlot(rhsOff);
+        if (!rhsReg.empty()) {
+            const char* mnemonic = nullptr;
+            switch (op.type) {
+                case IRInstrType::ADD: mnemonic = "add"; break;
+                case IRInstrType::SUB: mnemonic = "sub"; break;
+                case IRInstrType::MUL: mnemonic = "mul"; break;
+                case IRInstrType::DIV: mnemonic = "div"; break;
+                case IRInstrType::REM: mnemonic = "rem"; break;
+                case IRInstrType::SLT: mnemonic = "slt"; break;
+                default: return false;
+            }
+            if (spillLeft)
+                emitLine("    " + std::string(mnemonic) + " t0, t0, " + rhsReg);
+            else
+                emitLine("    " + std::string(mnemonic) + " t0, " + rhsReg + ", t0");
+            i += 3;
+            return true;
+        }
     }
+
+    if (rhs.type == IRInstrType::LI) {
+        const auto imm = static_cast<std::int32_t>(std::stoll(rhs.src1));
+        const auto cached = currentConstantRegs.find(imm);
+        const std::string cachedReg = cached == currentConstantRegs.end() ? std::string{} : cached->second;
+
+        switch (op.type) {
+            case IRInstrType::ADD:
+                if (imm == 0) {
+                    // t0 already is the result.
+                } else if (fitsImm12(imm)) {
+                    emitLine("    addi t0, t0, " + std::to_string(imm));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    add t0, t0, " + cachedReg);
+                } else {
+                    emitLine("    li t1, " + std::to_string(imm));
+                    emitLine("    add t0, t0, t1");
+                }
+                i += 3;
+                return true;
+
+            case IRInstrType::SUB:
+                if (spillLeft) {
+                    const std::int64_t neg = -static_cast<std::int64_t>(imm);
+                    if (imm == 0) {
+                        // unchanged
+                    } else if (neg >= -2048 && neg <= 2047) {
+                        emitLine("    addi t0, t0, " + std::to_string(neg));
+                    } else if (!cachedReg.empty()) {
+                        emitLine("    sub t0, t0, " + cachedReg);
+                    } else {
+                        emitLine("    li t1, " + std::to_string(imm));
+                        emitLine("    sub t0, t0, t1");
+                    }
+                } else {
+                    if (imm == 0) {
+                        emitLine("    neg t0, t0");
+                    } else {
+                        std::string r = cachedReg;
+                        if (r.empty()) {
+                            emitLine("    li t1, " + std::to_string(imm));
+                            r = "t1";
+                        }
+                        emitLine("    sub t0, " + r + ", t0");
+                    }
+                }
+                i += 3;
+                return true;
+
+            case IRInstrType::MUL: {
+                if (imm == 0) emitLine("    li t0, 0");
+                else if (imm == 1) {}
+                else if (imm == -1) emitLine("    neg t0, t0");
+                else {
+                    const std::uint32_t u = static_cast<std::uint32_t>(imm);
+                    const int sh = imm > 0 ? positivePow2Shift(u) : -1;
+                    if (sh >= 0) emitLine("    slli t0, t0, " + std::to_string(sh));
+                    else if (!cachedReg.empty()) emitLine("    mul t0, t0, " + cachedReg);
+                    else {
+                        emitLine("    li t1, " + std::to_string(imm));
+                        emitLine("    mul t0, t0, t1");
+                    }
+                }
+                i += 3;
+                return true;
+            }
+
+            case IRInstrType::DIV:
+                if (spillLeft) {
+                    if (imm == 0 || !emitSignedDivConst("t0", "t0", imm)) return false;
+                } else {
+                    std::string r = cachedReg;
+                    if (r.empty()) {
+                        emitLine("    li t1, " + std::to_string(imm));
+                        r = "t1";
+                    }
+                    emitLine("    div t0, " + r + ", t0");
+                }
+                i += 3;
+                return true;
+
+            case IRInstrType::REM:
+                if (spillLeft) {
+                    if (imm == 0 || !emitSignedRemConst("t0", "t0", imm)) return false;
+                } else {
+                    std::string r = cachedReg;
+                    if (r.empty()) {
+                        emitLine("    li t1, " + std::to_string(imm));
+                        r = "t1";
+                    }
+                    emitLine("    rem t0, " + r + ", t0");
+                }
+                i += 3;
+                return true;
+
+            case IRInstrType::SLT:
+                if (spillLeft && fitsImm12(imm)) {
+                    emitLine("    slti t0, t0, " + std::to_string(imm));
+                } else {
+                    std::string r = cachedReg;
+                    if (r.empty()) {
+                        emitLine("    li t1, " + std::to_string(imm));
+                        r = "t1";
+                    }
+                    if (spillLeft) emitLine("    slt t0, t0, " + r);
+                    else emitLine("    slt t0, " + r + ", t0");
+                }
+                i += 3;
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    // Conservative fallback for non-promoted loads / arguments / globals.
+    emitLine("    mv t1, t0");
+    emitInstr(rhs);
+    emitInstr(op);
     i += 3;
     return true;
 }
-
 
 std::string RiscvGenerator::promotedRegForSlot(int logicalOffset) const {
     auto it = currentPromotedSlots.find(logicalOffset);

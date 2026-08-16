@@ -1,5 +1,6 @@
 #include "codegen/riscv_generator.h"
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,11 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
     if (lhsReg.empty()) return false;
 
     const long long imm = std::stoll(rhs.src1);
+    std::string cachedReg;
+    if (imm >= std::numeric_limits<int>::min() && imm <= std::numeric_limits<int>::max()) {
+        auto it = currentConstantRegs.find(static_cast<int>(imm));
+        if (it != currentConstantRegs.end()) cachedReg = it->second;
+    }
 
     switch (op.type) {
         case IRInstrType::ADD:
@@ -36,6 +42,8 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
                 if (lhsReg != "t0") emitLine("    mv t0, " + lhsReg);
             } else if (imm >= -2048 && imm <= 2047) {
                 emitLine("    addi t0, " + lhsReg + ", " + std::to_string(imm));
+            } else if (!cachedReg.empty()) {
+                emitLine("    add t0, " + lhsReg + ", " + cachedReg);
             } else {
                 emitLine("    li t6, " + std::to_string(imm));
                 emitLine("    add t0, " + lhsReg + ", t6");
@@ -50,14 +58,20 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
                     const long long negImm = -imm;
                     if (negImm >= -2048 && negImm <= 2047) {
                         emitLine("    addi t0, " + lhsReg + ", " + std::to_string(negImm));
+                    } else if (!cachedReg.empty()) {
+                        emitLine("    sub t0, " + lhsReg + ", " + cachedReg);
                     } else {
                         emitLine("    li t6, " + std::to_string(imm));
                         emitLine("    sub t0, " + lhsReg + ", t6");
                     }
                 }
             } else {
-                emitLine("    li t6, " + std::to_string(imm));
-                emitLine("    sub t0, t6, " + lhsReg);
+                if (!cachedReg.empty()) {
+                    emitLine("    sub t0, " + cachedReg + ", " + lhsReg);
+                } else {
+                    emitLine("    li t6, " + std::to_string(imm));
+                    emitLine("    sub t0, t6, " + lhsReg);
+                }
             }
             break;
 
@@ -80,6 +94,8 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
                 emitLine("    neg t0, " + lhsReg);
             } else if (shift >= 0) {
                 emitLine("    slli t0, " + lhsReg + ", " + std::to_string(shift));
+            } else if (!cachedReg.empty()) {
+                emitLine("    mul t0, " + lhsReg + ", " + cachedReg);
             } else {
                 emitLine("    li t6, " + std::to_string(imm));
                 emitLine("    mul t0, " + lhsReg + ", t6");
@@ -91,8 +107,11 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
             if (standard) {
                 emitSignedDivConst("t0", lhsReg, static_cast<std::int32_t>(imm));
             } else {
-                emitLine("    li t6, " + std::to_string(imm));
-                emitLine("    div t0, t6, " + lhsReg);
+                if (!cachedReg.empty()) emitLine("    div t0, " + cachedReg + ", " + lhsReg);
+                else {
+                    emitLine("    li t6, " + std::to_string(imm));
+                    emitLine("    div t0, t6, " + lhsReg);
+                }
             }
             break;
 
@@ -100,14 +119,20 @@ bool RiscvGenerator::tryEmitImmediateBinaryValue(const std::vector<IRInstr>& v, 
             if (standard) {
                 emitSignedRemConst("t0", lhsReg, static_cast<std::int32_t>(imm));
             } else {
-                emitLine("    li t6, " + std::to_string(imm));
-                emitLine("    rem t0, t6, " + lhsReg);
+                if (!cachedReg.empty()) emitLine("    rem t0, " + cachedReg + ", " + lhsReg);
+                else {
+                    emitLine("    li t6, " + std::to_string(imm));
+                    emitLine("    rem t0, t6, " + lhsReg);
+                }
             }
             break;
 
         case IRInstrType::SLT:
             if (standard && imm >= -2048 && imm <= 2047) {
                 emitLine("    slti t0, " + lhsReg + ", " + std::to_string(imm));
+            } else if (!cachedReg.empty()) {
+                if (standard) emitLine("    slt t0, " + lhsReg + ", " + cachedReg);
+                else emitLine("    slt t0, " + cachedReg + ", " + lhsReg);
             } else {
                 emitLine("    li t6, " + std::to_string(imm));
                 if (standard) {

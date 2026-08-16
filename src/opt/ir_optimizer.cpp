@@ -573,6 +573,231 @@ bool propagateConstantsAcrossCFG(IRFunction& func) {
     return changed;
 }
 
+
+// Forward available-copy propagation for local stack slots.
+//
+// A fact `dst -> src` means that the current value stored in `dst` is identical
+// to the current value stored in `src`.  The fact is killed whenever either
+// endpoint is written, and CFG joins retain only facts that are identical on
+// every predecessor.  Calls do not invalidate local-slot facts because ToyC
+// has no pointers and a callee cannot address its caller's local stack frame.
+//
+// This deliberately propagates only exact LOAD/MV/STORE copies; arithmetic,
+// globals and argument registers are not guessed.  It is therefore much more
+// conservative than the earlier experimental cross-block alias pass while
+// still exposing the copy chains targeted by p03.
+struct CopyFlowState {
+    std::unordered_map<int, int> copies;
+};
+
+bool sameCopyState(const CopyFlowState& a, const CopyFlowState& b) {
+    return a.copies == b.copies;
+}
+
+int resolveCopySlot(const CopyFlowState& st, int slot) {
+    std::unordered_set<int> seen;
+    int cur = slot;
+    while (seen.insert(cur).second) {
+        auto it = st.copies.find(cur);
+        if (it == st.copies.end()) break;
+        cur = it->second;
+    }
+    return cur;
+}
+
+void killCopySlot(CopyFlowState& st, int slot) {
+    for (auto it = st.copies.begin(); it != st.copies.end();) {
+        if (it->first == slot || it->second == slot) it = st.copies.erase(it);
+        else ++it;
+    }
+}
+
+CopyFlowState meetCopyStates(const std::vector<const CopyFlowState*>& states) {
+    CopyFlowState out;
+    if (states.empty()) return out;
+    out = *states.front();
+    for (size_t i = 1; i < states.size(); ++i) {
+        for (auto it = out.copies.begin(); it != out.copies.end();) {
+            auto jt = states[i]->copies.find(it->first);
+            if (jt == states[i]->copies.end() || jt->second != it->second)
+                it = out.copies.erase(it);
+            else
+                ++it;
+        }
+    }
+    return out;
+}
+
+void transferCopyBlock(const std::vector<IRInstr>& instrs, size_t begin, size_t end,
+                       CopyFlowState& st, bool rewrite, bool& changed) {
+    std::unordered_map<std::string, int> regOrigin;
+
+    auto killReg = [&](const std::string& r) {
+        if (!r.empty()) regOrigin.erase(r);
+    };
+    auto setReg = [&](const std::string& r, std::optional<int> origin) {
+        if (r.empty()) return;
+        if (origin) regOrigin[r] = *origin;
+        else regOrigin.erase(r);
+    };
+
+    // const_cast is used only when rewrite==true; callers pass the actual
+    // function instruction vector in that phase.
+    auto& mutableInstrs = const_cast<std::vector<IRInstr>&>(instrs);
+
+    for (size_t i = begin; i < end; ++i) {
+        const IRInstr& ro = instrs[i];
+        IRInstr* rw = rewrite ? &mutableInstrs[i] : nullptr;
+
+        switch (ro.type) {
+            case IRInstrType::LOAD: {
+                int slot = 0;
+                if (!parseSlot(ro.src1, slot)) { killReg(ro.dest); break; }
+                int root = resolveCopySlot(st, slot);
+                if (rewrite && root != slot) {
+                    rw->src1 = std::to_string(root);
+                    changed = true;
+                }
+                setReg(ro.dest, root);
+                break;
+            }
+            case IRInstrType::MV: {
+                auto it = regOrigin.find(ro.src1);
+                setReg(ro.dest, it == regOrigin.end() ? std::optional<int>{}
+                                                       : std::optional<int>{it->second});
+                break;
+            }
+            case IRInstrType::STORE: {
+                int dst = 0;
+                if (!parseSlot(ro.src2, dst)) break;
+                auto it = regOrigin.find(ro.src1);
+                std::optional<int> src =
+                    it == regOrigin.end() ? std::optional<int>{}
+                                          : std::optional<int>{it->second};
+                killCopySlot(st, dst);
+                if (src && *src != dst) st.copies[dst] = *src;
+                break;
+            }
+
+            case IRInstrType::LI:
+            case IRInstrType::LOAD_ARG:
+            case IRInstrType::LOAD_GLOBAL:
+            case IRInstrType::ADD:
+            case IRInstrType::SUB:
+            case IRInstrType::MUL:
+            case IRInstrType::DIV:
+            case IRInstrType::REM:
+            case IRInstrType::SLT:
+            case IRInstrType::SEQZ:
+            case IRInstrType::SNEZ:
+                killReg(ro.dest);
+                break;
+
+            case IRInstrType::CALL:
+                // Only register origins are caller-clobbered. Local copy facts
+                // remain valid because ToyC has no pointer aliasing.
+                for (int r = 0; r <= 6; ++r) regOrigin.erase("t" + std::to_string(r));
+                for (int r = 0; r < 8; ++r) regOrigin.erase("a" + std::to_string(r));
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+bool propagateCopiesAcrossCFG(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n == 0) return false;
+
+    std::vector<size_t> starts{0};
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0 && func.instrs[i].type == IRInstrType::LABEL) starts.push_back(i);
+        auto t = func.instrs[i].type;
+        if ((t == IRInstrType::JUMP || t == IRInstrType::BRANCH_ZERO ||
+             t == IRInstrType::BRANCH_NONZERO || t == IRInstrType::RET) &&
+            i + 1 < n)
+            starts.push_back(i + 1);
+    }
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+
+    const size_t B = starts.size();
+    std::vector<size_t> ends(B);
+    std::vector<int> blockOf(n, -1);
+    for (size_t b = 0; b < B; ++b) {
+        ends[b] = (b + 1 < B ? starts[b + 1] : n);
+        for (size_t i = starts[b]; i < ends[b]; ++i) blockOf[i] = static_cast<int>(b);
+    }
+
+    std::unordered_map<std::string, int> labelBlock;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL)
+            labelBlock[func.instrs[i].label] = blockOf[i];
+
+    std::vector<std::vector<int>> succ(B), pred(B);
+    for (size_t b = 0; b < B; ++b) {
+        if (starts[b] >= ends[b]) continue;
+        const auto& last = func.instrs[ends[b] - 1];
+        auto add = [&](int x) {
+            if (x >= 0 && std::find(succ[b].begin(), succ[b].end(), x) == succ[b].end())
+                succ[b].push_back(x);
+        };
+        if (last.type == IRInstrType::JUMP) {
+            auto it = labelBlock.find(last.label);
+            if (it != labelBlock.end()) add(it->second);
+        } else if (last.type == IRInstrType::BRANCH_ZERO ||
+                   last.type == IRInstrType::BRANCH_NONZERO) {
+            auto it = labelBlock.find(last.label);
+            if (it != labelBlock.end()) add(it->second);
+            if (b + 1 < B) add(static_cast<int>(b + 1));
+        } else if (last.type != IRInstrType::RET && b + 1 < B) {
+            add(static_cast<int>(b + 1));
+        }
+    }
+    for (size_t b = 0; b < B; ++b)
+        for (int x : succ[b]) pred[x].push_back(static_cast<int>(b));
+
+    std::vector<CopyFlowState> in(B), out(B);
+    std::vector<bool> reachable(B, false), haveOut(B, false);
+    reachable[0] = true;
+
+    for (int iter = 0; iter < 100; ++iter) {
+        bool any = false;
+        for (size_t b = 0; b < B; ++b) {
+            if (b != 0) {
+                std::vector<const CopyFlowState*> ps;
+                for (int pidx : pred[b]) if (haveOut[pidx]) ps.push_back(&out[pidx]);
+                if (ps.empty()) continue;
+                CopyFlowState ni = meetCopyStates(ps);
+                if (!reachable[b] || !sameCopyState(ni, in[b])) {
+                    in[b] = std::move(ni);
+                    reachable[b] = true;
+                    any = true;
+                }
+            }
+            if (!reachable[b]) continue;
+            CopyFlowState st = in[b];
+            bool ignored = false;
+            transferCopyBlock(func.instrs, starts[b], ends[b], st, false, ignored);
+            if (!haveOut[b] || !sameCopyState(st, out[b])) {
+                out[b] = std::move(st);
+                haveOut[b] = true;
+                any = true;
+            }
+        }
+        if (!any) break;
+    }
+
+    bool changed = false;
+    for (size_t b = 0; b < B; ++b) {
+        if (!reachable[b]) continue;
+        CopyFlowState st = in[b];
+        transferCopyBlock(func.instrs, starts[b], ends[b], st, true, changed);
+    }
+    return changed;
+}
+
 bool removeUnreachableAfterJump(IRFunction& func) {
     bool changed = false;
     std::vector<IRInstr> out;
@@ -951,6 +1176,96 @@ bool eliminateDirectTailRecursion(IRFunction& func) {
     return true;
 }
 
+
+// After leaf inlining, the generic call-result convention often remains:
+//
+//   LOAD/MV/LI a0, value
+//   JUMP .ret_helper.inlN
+//   ...
+//   LOAD/MV/LI a0, other
+// .ret_helper.inlN:
+//   MV t0, a0
+//   STORE t0, dst
+//
+// The helper is already inlined, so routing every return through a0 is pure
+// overhead.  When all incoming returns are simple a0 definitions, write the
+// caller's destination slot on each return edge and remove the join copy.
+bool forwardInlineReturnsToDestination(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 4) return false;
+
+    auto simpleA0Def = [](const IRInstr& ins) {
+        if (ins.dest != "a0") return false;
+        return ins.type == IRInstrType::LOAD || ins.type == IRInstrType::LI ||
+               ins.type == IRInstrType::MV || ins.type == IRInstrType::LOAD_GLOBAL ||
+               ins.type == IRInstrType::LOAD_ARG;
+    };
+
+    for (size_t l = 0; l + 2 < n; ++l) {
+        const auto& lab = func.instrs[l];
+        if (lab.type != IRInstrType::LABEL ||
+            lab.label.find(".ret_") == std::string::npos ||
+            lab.label.find(".inl") == std::string::npos)
+            continue;
+        if (func.instrs[l + 1].type != IRInstrType::MV ||
+            func.instrs[l + 1].dest != "t0" ||
+            func.instrs[l + 1].src1 != "a0" ||
+            func.instrs[l + 2].type != IRInstrType::STORE ||
+            func.instrs[l + 2].src1 != "t0")
+            continue;
+
+        const std::string retLabel = lab.label;
+        const std::string dstSlot = func.instrs[l + 2].src2;
+
+        // Every explicit incoming edge must be an unconditional jump whose
+        // immediately preceding instruction is a simple a0 definition.
+        std::vector<size_t> jumpDefs;
+        bool safe = true;
+        for (size_t i = 0; i < n; ++i) {
+            const auto& ins = func.instrs[i];
+            if ((ins.type == IRInstrType::BRANCH_ZERO ||
+                 ins.type == IRInstrType::BRANCH_NONZERO) &&
+                ins.label == retLabel) {
+                safe = false;
+                break;
+            }
+            if (ins.type == IRInstrType::JUMP && ins.label == retLabel) {
+                if (i == 0 || !simpleA0Def(func.instrs[i - 1])) {
+                    safe = false;
+                    break;
+                }
+                jumpDefs.push_back(i - 1);
+            }
+        }
+        if (!safe) continue;
+
+        // The fallthrough predecessor also has to define a0 directly.
+        if (l == 0 || !simpleA0Def(func.instrs[l - 1])) continue;
+        const size_t fallDef = l - 1;
+
+        std::unordered_set<size_t> defs(jumpDefs.begin(), jumpDefs.end());
+        defs.insert(fallDef);
+
+        std::vector<IRInstr> out;
+        out.reserve(n + defs.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (i == l + 1 || i == l + 2) continue;
+
+            IRInstr ins = func.instrs[i];
+            if (defs.count(i)) {
+                ins.dest = "t0";
+                out.push_back(std::move(ins));
+                out.emplace_back(IRInstrType::STORE, "", "t0", dstSlot);
+            } else {
+                out.push_back(std::move(ins));
+            }
+        }
+        func.instrs.swap(out);
+        return true; // one join at a time; optimizer rounds recompute analyses
+    }
+    return false;
+}
+
 bool removeRedundantDirectReturnCopies(IRFunction& func) {
     const std::string returnLabel = ".ret_" + func.name;
     bool changed=false;
@@ -990,6 +1305,132 @@ bool removeJumpToNextLabel(IRFunction& func) {
 }
 
 
+
+
+// Sink loop-final copies out of a simple loop.
+//
+// After available-copy propagation, copy benchmarks commonly contain
+//     LOAD t0, src
+//     STORE t0, dst
+// on every iteration even though dst is never read in the loop and only its
+// final value is needed after exit.  If the loop is proven to execute at least
+// once, and src is not modified after the copy before the back edge, the copy
+// can be performed once at the exit instead of once per trip.
+bool sinkLoopFinalCopies(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 8) return false;
+
+    std::unordered_map<std::string,size_t> labels;
+    for (size_t i=0;i<n;++i)
+        if (func.instrs[i].type==IRInstrType::LABEL) labels[func.instrs[i].label]=i;
+
+    for (size_t j=n; j-- > 0;) {
+        if (func.instrs[j].type!=IRInstrType::JUMP) continue;
+        auto hit=labels.find(func.instrs[j].label);
+        if(hit==labels.end()||hit->second>=j) continue;
+        const size_t h=hit->second;
+        if(j+1>=n||func.instrs[j+1].type!=IRInstrType::LABEL) continue;
+        const std::string exitLabel=func.instrs[j+1].label;
+
+        // Restrict to a canonical straight-line while loop with one exit branch.
+        int exitBranches=0; bool simple=true;
+        size_t branchPos=n;
+        for(size_t k=h+1;k<j;++k){
+            auto t=func.instrs[k].type;
+            if(t==IRInstrType::LABEL||t==IRInstrType::JUMP||t==IRInstrType::CALL||
+               t==IRInstrType::STORE_GLOBAL||t==IRInstrType::STORE_ARG||t==IRInstrType::RET){
+                simple=false;break;
+            }
+            if(t==IRInstrType::BRANCH_ZERO||t==IRInstrType::BRANCH_NONZERO){
+                if(func.instrs[k].label!=exitLabel){simple=false;break;}
+                ++exitBranches; branchPos=k;
+            }
+        }
+        if(!simple||exitBranches!=1||branchPos<3) continue;
+
+        // Prove at least one trip for the common `iv < constant` form:
+        //   LI bound; LOAD iv; SLT; BRANCH_ZERO exit
+        const auto& li=func.instrs[branchPos-3];
+        const auto& ld=func.instrs[branchPos-2];
+        const auto& cmp=func.instrs[branchPos-1];
+        const auto& br=func.instrs[branchPos];
+        if(li.type!=IRInstrType::LI||li.dest!="t0"||
+           ld.type!=IRInstrType::LOAD||ld.dest!="t1"||
+           cmp.type!=IRInstrType::SLT||cmp.dest!="t0"||
+           cmp.src1!="t1"||cmp.src2!="t0"||
+           br.type!=IRInstrType::BRANCH_ZERO||br.src1!="t0")
+            continue;
+        int iv=0; if(!parseSlot(ld.src1,iv)) continue;
+        const int32_t bound=static_cast<int32_t>(std::strtoll(li.src1.c_str(),nullptr,10));
+
+        ConstFlowState pre;
+        for(size_t k=0;k<h;++k) transferConstInstr(func.instrs[k],pre);
+        auto initIt=pre.slots.find(iv);
+        if(initIt==pre.slots.end()||!(initIt->second<bound)) continue;
+
+        std::unordered_map<int,int> loadCount,storeCount;
+        for(size_t k=h+1;k<j;++k){
+            if(auto u=slotUse(func.instrs[k])) ++loadCount[*u];
+            if(auto d=slotDef(func.instrs[k])) ++storeCount[*d];
+        }
+
+        struct Candidate { size_t loadPos; size_t storePos; int src; int dst; };
+        std::vector<Candidate> cand;
+        for(size_t k=branchPos+1;k+1<j;++k){
+            const auto& a=func.instrs[k];
+            const auto& b=func.instrs[k+1];
+            if(a.type!=IRInstrType::LOAD||a.dest!="t0"||
+               b.type!=IRInstrType::STORE||b.src1!="t0") continue;
+            int src=0,dst=0;
+            if(!parseSlot(a.src1,src)||!parseSlot(b.src2,dst)||src==dst) continue;
+            if(storeCount[dst]!=1||loadCount[dst]!=0) continue;
+
+            // The source at loop exit must still equal the value copied here.
+            bool sourceChangedLater=false;
+            for(size_t q=k+2;q<j;++q){
+                auto d=slotDef(func.instrs[q]);
+                if(d&&*d==src){sourceChangedLater=true;break;}
+            }
+            if(sourceChangedLater) continue;
+            cand.push_back({k,k+1,src,dst});
+            ++k;
+        }
+        if(cand.empty()) continue;
+
+        std::vector<char> remove(n,0);
+        for(const auto& c:cand){remove[c.loadPos]=1;remove[c.storePos]=1;}
+
+        // The exit label must not be a shared target from outside the loop;
+        // otherwise sinking would also execute on paths that bypass the loop.
+        bool sharedExit=false;
+        for(size_t q=0;q<n;++q){
+            if(q>=h&&q<=j) continue;
+            const auto& ins=func.instrs[q];
+            if((ins.type==IRInstrType::JUMP||ins.type==IRInstrType::BRANCH_ZERO||
+                ins.type==IRInstrType::BRANCH_NONZERO)&&ins.label==exitLabel){
+                sharedExit=true;break;
+            }
+        }
+        if(sharedExit) continue;
+
+        std::vector<IRInstr> out;
+        out.reserve(n+cand.size()*2);
+        for(size_t k=0;k<n;++k){
+            if(!remove[k]) out.push_back(func.instrs[k]);
+            if(k==j+1){
+                // Branches target the LABEL itself, so materialize the final
+                // copies immediately *after* the label, not before it.
+                for(const auto& c:cand){
+                    out.emplace_back(IRInstrType::LOAD,"t0",std::to_string(c.src));
+                    out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(c.dst));
+                }
+            }
+        }
+        func.instrs.swap(out);
+        return true; // recompute CFG/liveness in the next round
+    }
+    return false;
+}
 
 // Hoist the common invariant scalar form
 //   LI imm; LOAD invariantSlot; ADD/SUB/MUL; STORE tempSlot
@@ -1069,7 +1510,7 @@ bool unrollSimpleLoops(IRFunction& func) {
         if(!ok||branchCount!=1) continue;
         const size_t segBegin=h+1, segEnd=j;
         const size_t segLen=segEnd-segBegin;
-        if(segLen==0 || segLen>12) continue; // avoid pathological code growth
+        if(segLen==0 || segLen>32) continue; // cap code growth, but include typical arithmetic/matrix loops
         std::vector<IRInstr> repl; repl.reserve(func.instrs.size()+segLen*3);
         repl.insert(repl.end(),func.instrs.begin(),func.instrs.begin()+static_cast<long>(j));
         // Existing first copy is already present before j; append three more.
@@ -1091,10 +1532,13 @@ void optimizeFunction(IRFunction& func) {
     for (int round = 0; round < 4; ++round) {
         bool changed = false;
         changed |= propagateConstantsAcrossCFG(func);
+        changed |= propagateCopiesAcrossCFG(func);
         changed |= simplifyLocally(func);
         changed |= removeUnreachableAfterJump(func);
         changed |= eliminateUnreachableCFG(func);
         changed |= eliminateDeadPureLoops(func);
+        changed |= sinkLoopFinalCopies(func);
+        changed |= forwardInlineReturnsToDestination(func);
         changed |= eliminateDeadStores(func);
         changed |= eliminateDeadRegisterComputations(func);
         changed |= removeRedundantDirectReturnCopies(func);

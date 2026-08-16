@@ -13,10 +13,37 @@ namespace {
 bool hasAdditionalLoadOfSlotSplit(const std::vector<IRInstr>& instrs,
                                   const std::string& slot,
                                   size_t immediateLoadIndex) {
-    for (size_t j = immediateLoadIndex + 1; j < instrs.size(); ++j) {
-        if (instrs[j].type == IRInstrType::LOAD && instrs[j].src1 == slot) {
-            return true;
+    // Follow real CFG successors, not just textual order. A value spilled inside
+    // a loop can be loaded on the next iteration through a backward edge even
+    // when there is no later textual LOAD. Stop a path as soon as the slot is
+    // redefined; that STORE starts a new value version.
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t k = 0; k < instrs.size(); ++k) {
+        if (instrs[k].type == IRInstrType::LABEL) labels[instrs[k].label] = k;
+    }
+    std::vector<unsigned char> seen(instrs.size(), 0);
+    std::vector<size_t> work;
+    if (immediateLoadIndex + 1 < instrs.size()) work.push_back(immediateLoadIndex + 1);
+    while (!work.empty()) {
+        const size_t j = work.back(); work.pop_back();
+        if (j >= instrs.size() || seen[j]) continue;
+        seen[j] = 1;
+        const auto& in = instrs[j];
+        if (in.type == IRInstrType::LOAD && in.src1 == slot) return true;
+        if (in.type == IRInstrType::STORE && in.src2 == slot) continue;
+        if (in.type == IRInstrType::RET) continue;
+        if (in.type == IRInstrType::JUMP) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            continue;
         }
+        if (in.type == IRInstrType::BRANCH_ZERO || in.type == IRInstrType::BRANCH_NONZERO) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            if (j + 1 < instrs.size()) work.push_back(j + 1);
+            continue;
+        }
+        if (j + 1 < instrs.size()) work.push_back(j + 1);
     }
     return false;
 }

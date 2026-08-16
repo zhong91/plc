@@ -22,6 +22,7 @@ add_library(toycc_frontend
     src/codegen/riscv_generator_values.cpp
     src/codegen/riscv_generator_values_mulacc.cpp
     src/codegen/riscv_generator_values_immediate.cpp
+    src/codegen/riscv_generator_operands.cpp
     src/codegen/riscv_generator_generate.cpp
     src/opt/compile_time_evaluator.cpp
     src/opt/ir_compile_time_evaluator.cpp
@@ -58,6 +59,7 @@ if(MSVC)
     src/codegen/riscv_generator_values.cpp
     src/codegen/riscv_generator_values_mulacc.cpp
     src/codegen/riscv_generator_values_immediate.cpp
+    src/codegen/riscv_generator_operands.cpp
     src/codegen/riscv_generator_generate.cpp
         PROPERTIES COMPILE_OPTIONS "/Od;/Ob0"
     )

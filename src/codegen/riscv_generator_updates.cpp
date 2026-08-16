@@ -13,10 +13,37 @@ namespace {
 bool hasAdditionalLoadOfSlotSplit(const std::vector<IRInstr>& instrs,
                                   const std::string& slot,
                                   size_t immediateLoadIndex) {
-    for (size_t j = immediateLoadIndex + 1; j < instrs.size(); ++j) {
-        if (instrs[j].type == IRInstrType::LOAD && instrs[j].src1 == slot) {
-            return true;
+    // Follow real CFG successors, not just textual order. A value spilled inside
+    // a loop can be loaded on the next iteration through a backward edge even
+    // when there is no later textual LOAD. Stop a path as soon as the slot is
+    // redefined; that STORE starts a new value version.
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t k = 0; k < instrs.size(); ++k) {
+        if (instrs[k].type == IRInstrType::LABEL) labels[instrs[k].label] = k;
+    }
+    std::vector<unsigned char> seen(instrs.size(), 0);
+    std::vector<size_t> work;
+    if (immediateLoadIndex + 1 < instrs.size()) work.push_back(immediateLoadIndex + 1);
+    while (!work.empty()) {
+        const size_t j = work.back(); work.pop_back();
+        if (j >= instrs.size() || seen[j]) continue;
+        seen[j] = 1;
+        const auto& in = instrs[j];
+        if (in.type == IRInstrType::LOAD && in.src1 == slot) return true;
+        if (in.type == IRInstrType::STORE && in.src2 == slot) continue;
+        if (in.type == IRInstrType::RET) continue;
+        if (in.type == IRInstrType::JUMP) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            continue;
         }
+        if (in.type == IRInstrType::BRANCH_ZERO || in.type == IRInstrType::BRANCH_NONZERO) {
+            auto it = labels.find(in.label);
+            if (it != labels.end()) work.push_back(it->second);
+            if (j + 1 < instrs.size()) work.push_back(j + 1);
+            continue;
+        }
+        if (j + 1 < instrs.size()) work.push_back(j + 1);
     }
     return false;
 }
@@ -48,11 +75,18 @@ bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, si
 
     if (rhs.type == IRInstrType::LI && rhs.dest == "t0") {
         long long imm = std::stoll(rhs.src1);
+        std::string cachedReg;
+        if (imm >= std::numeric_limits<int>::min() && imm <= std::numeric_limits<int>::max()) {
+            auto cit = currentConstantRegs.find(static_cast<int>(imm));
+            if (cit != currentConstantRegs.end()) cachedReg = cit->second;
+        }
         switch (op.type) {
             case IRInstrType::ADD:
                 if (imm == 0) { copyLhs(); }
                 else if (imm >= -2048 && imm <= 2047) {
                     emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    add " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 } else {
                     emitLine("    li t1, " + std::to_string(imm));
                     emitLine("    add " + dstReg + ", " + lhsReg + ", t1");
@@ -63,6 +97,8 @@ bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, si
                 if (imm == 0) { copyLhs(); }
                 else if (neg >= -2048 && neg <= 2047) {
                     emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(neg));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    sub " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 } else {
                     emitLine("    li t1, " + std::to_string(imm));
                     emitLine("    sub " + dstReg + ", " + lhsReg + ", t1");
@@ -76,6 +112,8 @@ bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, si
                 else if (imm > 0 && (imm & (imm - 1)) == 0) {
                     int sh = 0; long long x = imm; while (x > 1) { ++sh; x >>= 1; }
                     emitLine("    slli " + dstReg + ", " + lhsReg + ", " + std::to_string(sh));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    mul " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 } else {
                     emitLine("    li t1, " + std::to_string(imm));
                     emitLine("    mul " + dstReg + ", " + lhsReg + ", t1");
@@ -90,6 +128,8 @@ bool RiscvGenerator::tryEmitDirectBinaryUpdate(const std::vector<IRInstr>& v, si
             case IRInstrType::SLT:
                 if (imm >= -2048 && imm <= 2047) {
                     emitLine("    slti " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    slt " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 } else {
                     emitLine("    li t1, " + std::to_string(imm));
                     emitLine("    slt " + dstReg + ", " + lhsReg + ", t1");
@@ -153,11 +193,18 @@ bool RiscvGenerator::tryEmitOptimizedBinaryUpdate(const std::vector<IRInstr>& v,
 
     if (rhs.type == IRInstrType::LI) {
         long long imm = std::stoll(rhs.src1);
+        std::string cachedReg;
+        if (imm >= std::numeric_limits<int>::min() && imm <= std::numeric_limits<int>::max()) {
+            auto cit = currentConstantRegs.find(static_cast<int>(imm));
+            if (cit != currentConstantRegs.end()) cachedReg = cit->second;
+        }
         switch (op.type) {
             case IRInstrType::ADD:
                 if (imm == 0) copyLhs();
                 else if (imm >= -2048 && imm <= 2047)
                     emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                else if (!cachedReg.empty())
+                    emitLine("    add " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 else {
                     emitLine("    li t6, " + std::to_string(imm));
                     emitLine("    add " + dstReg + ", " + lhsReg + ", t6");
@@ -168,6 +215,8 @@ bool RiscvGenerator::tryEmitOptimizedBinaryUpdate(const std::vector<IRInstr>& v,
                 if (imm == 0) copyLhs();
                 else if (neg >= -2048 && neg <= 2047)
                     emitLine("    addi " + dstReg + ", " + lhsReg + ", " + std::to_string(neg));
+                else if (!cachedReg.empty())
+                    emitLine("    sub " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 else {
                     emitLine("    li t6, " + std::to_string(imm));
                     emitLine("    sub " + dstReg + ", " + lhsReg + ", t6");
@@ -181,29 +230,26 @@ bool RiscvGenerator::tryEmitOptimizedBinaryUpdate(const std::vector<IRInstr>& v,
                 else if (imm > 0 && (imm & (imm - 1)) == 0) {
                     int sh = 0; long long x = imm; while (x > 1) { ++sh; x >>= 1; }
                     emitLine("    slli " + dstReg + ", " + lhsReg + ", " + std::to_string(sh));
+                } else if (!cachedReg.empty()) {
+                    emitLine("    mul " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 } else {
                     emitLine("    li t6, " + std::to_string(imm));
                     emitLine("    mul " + dstReg + ", " + lhsReg + ", t6");
                 }
                 break;
             case IRInstrType::DIV:
-                if (imm == 1) copyLhs();
-                else if (imm == -1) emitLine("    neg " + dstReg + ", " + lhsReg);
-                else {
-                    emitLine("    li t6, " + std::to_string(imm));
-                    emitLine("    div " + dstReg + ", " + lhsReg + ", t6");
-                }
+                if (imm == 0 || !emitSignedDivConst(dstReg, lhsReg, static_cast<std::int32_t>(imm)))
+                    return false;
                 break;
             case IRInstrType::REM:
-                if (imm == 1 || imm == -1) emitLine("    li " + dstReg + ", 0");
-                else {
-                    emitLine("    li t6, " + std::to_string(imm));
-                    emitLine("    rem " + dstReg + ", " + lhsReg + ", t6");
-                }
+                if (imm == 0 || !emitSignedRemConst(dstReg, lhsReg, static_cast<std::int32_t>(imm)))
+                    return false;
                 break;
             case IRInstrType::SLT:
                 if (imm >= -2048 && imm <= 2047)
                     emitLine("    slti " + dstReg + ", " + lhsReg + ", " + std::to_string(imm));
+                else if (!cachedReg.empty())
+                    emitLine("    slt " + dstReg + ", " + lhsReg + ", " + cachedReg);
                 else {
                     emitLine("    li t6, " + std::to_string(imm));
                     emitLine("    slt " + dstReg + ", " + lhsReg + ", t6");
