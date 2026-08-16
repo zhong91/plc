@@ -24,6 +24,7 @@ enum class Op : std::uint8_t {
     AddLocLoc, SubLocLoc, MulLocLoc, DivLocLoc, RemLocLoc,
     AddMulLocImm, SubMulLocImm, AddMulLocLoc, SubMulLocLoc,
     BrLocLtImm, BrLocGeImm, BrLocGtImm, BrLocLeImm, BrLocEqImm, BrLocNeImm,
+    BrLocLtLoc, BrLocGeLoc, BrLocGtLoc, BrLocLeLoc, BrLocEqLoc, BrLocNeLoc,
     FastLinearLoop, FastPolyLoop
 };
 
@@ -52,6 +53,7 @@ struct FastLoop {
     Op exitOp=Op::BrLocGeImm;
     std::int16_t iv=-1;
     std::int32_t bound=0;
+    std::int16_t boundSlot=-1;
     std::int32_t step=0;
     std::int32_t exitPc=0;
     std::vector<LinearUpdate> updates;
@@ -60,6 +62,7 @@ struct PolyLoop {
     Op exitOp=Op::BrLocGeImm;
     std::int16_t iv=-1;
     std::int32_t bound=0;
+    std::int16_t boundSlot=-1;
     std::int32_t exitPc=0;
     std::int32_t bodyBegin=0;
     std::int32_t bodyEnd=0; // exclusive, excludes backward JUMP
@@ -203,6 +206,40 @@ void fuseSuperInstructions(Fn& fn) {
             y.aux=c[bi].imm; y.skip=static_cast<std::uint8_t>(bi-i); c[i]=y; continue;
         }
 
+        // LOAD rhs ; LOAD lhs ; SLT t0,t1,t0 ; [SEQZ] ; BRANCH.
+        // This preserves local-vs-local comparisons as a single host operation,
+        // which lets nested loops use an outer local as the inner bound.
+        if (i + 3 < n && is(i, Op::Load) && c[i].d == R_T0 &&
+            is(i + 1, Op::Load) && c[i + 1].d == 1 &&
+            is(i + 2, Op::Slt) && c[i + 2].d == R_T0) {
+            bool reversed = c[i + 2].a == R_T0 && c[i + 2].b == 1;
+            bool normal = c[i + 2].a == 1 && c[i + 2].b == R_T0;
+            if (reversed || normal) {
+                size_t bi=i+3; bool negated=false;
+                if (bi<n && is(bi,Op::Seqz) && c[bi].d==R_T0 && c[bi].a==R_T0){negated=true;++bi;}
+                if (bi<n && (c[bi].op==Op::Bz||c[bi].op==Op::Bnz) && c[bi].a==R_T0) {
+                    bool branchOnCond=(c[bi].op==Op::Bnz); if(negated)branchOnCond=!branchOnCond;
+                    Op bop=Op::Nop;
+                    if(normal)bop=branchOnCond?Op::BrLocLtLoc:Op::BrLocGeLoc;
+                    else bop=branchOnCond?Op::BrLocGtLoc:Op::BrLocLeLoc;
+                    BC y;y.op=bop;y.a=static_cast<int16_t>(c[i+1].imm);y.b=static_cast<int16_t>(c[i].imm);
+                    y.aux=c[bi].imm;y.skip=static_cast<uint8_t>(bi-i);c[i]=y;continue;
+                }
+            }
+        }
+
+        // LOAD rhs ; LOAD lhs ; SUB ; SEQZ/SNEZ ; BRANCH.
+        if (i + 4 < n && is(i,Op::Load) && c[i].d==R_T0 &&
+            is(i+1,Op::Load) && c[i+1].d==1 && is(i+2,Op::Sub) &&
+            c[i+2].d==R_T0 && c[i+2].a==1 && c[i+2].b==R_T0 &&
+            (is(i+3,Op::Seqz)||is(i+3,Op::Snez)) && c[i+3].d==R_T0 && c[i+3].a==R_T0 &&
+            (is(i+4,Op::Bz)||is(i+4,Op::Bnz)) && c[i+4].a==R_T0) {
+            bool exprEq=is(i+3,Op::Seqz), branchOnTrue=is(i+4,Op::Bnz);
+            bool wantEq=branchOnTrue?exprEq:!exprEq;
+            BC y;y.op=wantEq?Op::BrLocEqLoc:Op::BrLocNeLoc;
+            y.a=static_cast<int16_t>(c[i+1].imm);y.b=static_cast<int16_t>(c[i].imm);y.aux=c[i+4].imm;y.skip=4;c[i]=y;continue;
+        }
+
         // LI rhs ; LOAD lhs ; SUB t0,t1,t0 ; SEQZ/SNEZ ; BRANCH
         if (i + 4 < n && is(i, Op::Li) && c[i].d == R_T0 &&
             is(i + 1, Op::Load) && c[i + 1].d == 1 &&
@@ -242,6 +279,8 @@ void fuseLinearLoops(Fn& fn) {
                     if(eq(q.a)||eq(q.b)||eq(q.d)) return true; break;
                 case Op::BrLocLtImm: case Op::BrLocGeImm: case Op::BrLocGtImm: case Op::BrLocLeImm: case Op::BrLocEqImm: case Op::BrLocNeImm:
                     if(eq(q.a)) return true; break;
+                case Op::BrLocLtLoc: case Op::BrLocGeLoc: case Op::BrLocGtLoc: case Op::BrLocLeLoc: case Op::BrLocEqLoc: case Op::BrLocNeLoc:
+                    if(eq(q.a)||eq(q.b)) return true; break;
                 default: break;
             }
         }
@@ -251,14 +290,16 @@ void fuseLinearLoops(Fn& fn) {
         if(c[ji].op!=Op::Jump || c[ji].imm<0 || static_cast<size_t>(c[ji].imm)>=ji) continue;
         size_t k=static_cast<size_t>(c[ji].imm); nextEffective(k); if(k>=ji) continue;
         Op exitOp=c[k].op;
-        if(!(exitOp==Op::BrLocGeImm||exitOp==Op::BrLocGtImm||exitOp==Op::BrLocLeImm||exitOp==Op::BrLocLtImm)) continue;
-        const int iv=c[k].a, bound=c[k].imm, exitPc=c[k].aux;
+        const bool localBound=(exitOp==Op::BrLocGeLoc||exitOp==Op::BrLocGtLoc||exitOp==Op::BrLocLeLoc||exitOp==Op::BrLocLtLoc);
+        if(!(exitOp==Op::BrLocGeImm||exitOp==Op::BrLocGtImm||exitOp==Op::BrLocLeImm||exitOp==Op::BrLocLtImm||localBound)) continue;
+        const int iv=c[k].a, bound=localBound?0:c[k].imm, boundSlot=localBound?c[k].b:-1, exitPc=c[k].aux;
         if(iv<0) continue;
         std::vector<LinearUpdate> canonical; bool ok=true; int groups=0;
         while(k<ji){
             nextEffective(k); if(k>=ji) break;
             const BC& br=c[k];
-            if(br.op!=exitOp||br.a!=iv||br.imm!=bound||br.aux!=exitPc){ok=false;break;}
+            if(br.op!=exitOp||br.a!=iv||br.aux!=exitPc||
+               (localBound ? br.b!=boundSlot : br.imm!=bound)){ok=false;break;}
             ++groups; k += 1 + br.skip;
             std::vector<LinearUpdate> ups;
             while(k<ji){
@@ -355,10 +396,11 @@ void fuseLinearLoops(Fn& fn) {
             for(const auto& u:canonical) if(u.ivScaleSlot>=0 && count.count(u.ivScaleSlot)) { multOK=false; break; }
             if(!multOK) continue;
         }
-        bool directionOK=((exitOp==Op::BrLocGeImm||exitOp==Op::BrLocGtImm)&&step>0)||
-                         ((exitOp==Op::BrLocLeImm||exitOp==Op::BrLocLtImm)&&step<0);
+        bool directionOK=((exitOp==Op::BrLocGeImm||exitOp==Op::BrLocGtImm||exitOp==Op::BrLocGeLoc||exitOp==Op::BrLocGtLoc)&&step>0)||
+                         ((exitOp==Op::BrLocLeImm||exitOp==Op::BrLocLtImm||exitOp==Op::BrLocLeLoc||exitOp==Op::BrLocLtLoc)&&step<0);
         if(!directionOK) continue;
-        FastLoop fl;fl.exitOp=exitOp;fl.iv=iv;fl.bound=bound;fl.step=step;fl.exitPc=exitPc;fl.updates=canonical;
+        if(localBound){for(const auto& u:canonical)if(u.slot==boundSlot){directionOK=false;break;}if(!directionOK)continue;}
+        FastLoop fl;fl.exitOp=exitOp;fl.iv=iv;fl.bound=bound;fl.boundSlot=static_cast<int16_t>(boundSlot);fl.step=step;fl.exitPc=exitPc;fl.updates=canonical;
         int idx=static_cast<int>(fn.fastLoops.size());fn.fastLoops.push_back(std::move(fl));
         BC y; y.op=Op::FastLinearLoop; y.imm=idx; c[static_cast<size_t>(c[ji].imm)]=y;
     }
@@ -368,8 +410,11 @@ void fuseLinearLoops(Fn& fn) {
 void fusePolynomialLoops(Fn& fn) {
     auto& c=fn.code; const size_t n=c.size();
     auto next=[&](size_t& k){while(k<n&&c[k].op==Op::Nop)++k;};
-    auto isBranch=[](Op o){return o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm;};
-    auto invert=[](Op o){if(o==Op::BrLocLtImm)return Op::BrLocGeImm;if(o==Op::BrLocGeImm)return Op::BrLocLtImm;if(o==Op::BrLocGtImm)return Op::BrLocLeImm;return Op::BrLocGtImm;};
+    auto isBranch=[](Op o){return o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm||o==Op::BrLocLtLoc||o==Op::BrLocGeLoc||o==Op::BrLocGtLoc||o==Op::BrLocLeLoc;};
+    auto invert=[](Op o){
+        if(o==Op::BrLocLtImm)return Op::BrLocGeImm;if(o==Op::BrLocGeImm)return Op::BrLocLtImm;if(o==Op::BrLocGtImm)return Op::BrLocLeImm;if(o==Op::BrLocLeImm)return Op::BrLocGtImm;
+        if(o==Op::BrLocLtLoc)return Op::BrLocGeLoc;if(o==Op::BrLocGeLoc)return Op::BrLocLtLoc;if(o==Op::BrLocGtLoc)return Op::BrLocLeLoc;return Op::BrLocGtLoc;
+    };
     auto addReads=[&](const BC&q,std::unordered_set<int>& live){
         auto add=[&](int z){if(z>=0)live.insert(z);};
         switch(q.op){
@@ -380,6 +425,7 @@ void fusePolynomialLoops(Fn& fn) {
             case Op::AddMulLocImm:case Op::SubMulLocImm:add(q.a);add(q.d);break;
             case Op::AddMulLocLoc:case Op::SubMulLocLoc:add(q.a);add(q.b);add(q.d);break;
             case Op::BrLocLtImm:case Op::BrLocGeImm:case Op::BrLocGtImm:case Op::BrLocLeImm:case Op::BrLocEqImm:case Op::BrLocNeImm:add(q.a);break;
+            case Op::BrLocLtLoc:case Op::BrLocGeLoc:case Op::BrLocGtLoc:case Op::BrLocLeLoc:case Op::BrLocEqLoc:case Op::BrLocNeLoc:add(q.a);add(q.b);break;
             default:break;
         }
     };
@@ -388,7 +434,9 @@ void fusePolynomialLoops(Fn& fn) {
         const size_t h=static_cast<size_t>(c[j].imm);
         size_t k=h;next(k);if(k>=j||c[k].op==Op::FastLinearLoop||c[k].op==Op::FastPolyLoop||!isBranch(c[k].op))continue;
         const BC br=c[k];
-        Op exitOp=br.op;int exitPc=br.aux;size_t body=k+1+br.skip;next(body);
+        Op exitOp=br.op;int exitPc=br.aux;
+        int boundSlot=(exitOp==Op::BrLocLtLoc||exitOp==Op::BrLocGeLoc||exitOp==Op::BrLocGtLoc||exitOp==Op::BrLocLeLoc)?br.b:-1;
+        size_t body=k+1+br.skip;next(body);
         // Tail-recursion layout: the branch goes into the loop body, while the
         // fallthrough executes a small base-case return block and jumps beyond
         // the back edge. Invert the predicate and summarize the branch target.
@@ -431,6 +479,7 @@ void fusePolynomialLoops(Fn& fn) {
             q+=1+x.skip;
         }
         if(!safe||!mods.count(br.a))continue;
+        if(boundSlot>=0 && mods.count(boundSlot))continue;
         std::unordered_set<int> live;
         // Follow bytecode CFG from the loop exit rather than scanning textually:
         // tail-recursion layouts place the loop body after a base-case jump, so
@@ -441,10 +490,10 @@ void fusePolynomialLoops(Fn& fn) {
             auto push=[&](size_t x){if(x<n&&!seen[x])work.push_back(x);};
             if(z.op==Op::Jump)push(static_cast<size_t>(z.imm));
             else if(z.op==Op::Bz||z.op==Op::Bnz){push(static_cast<size_t>(z.imm));push(q+1+z.skip);}
-            else if(z.op==Op::BrLocLtImm||z.op==Op::BrLocGeImm||z.op==Op::BrLocGtImm||z.op==Op::BrLocLeImm||z.op==Op::BrLocEqImm||z.op==Op::BrLocNeImm){push(static_cast<size_t>(z.aux));push(q+1+z.skip);}
+            else if(z.op==Op::BrLocLtImm||z.op==Op::BrLocGeImm||z.op==Op::BrLocGtImm||z.op==Op::BrLocLeImm||z.op==Op::BrLocEqImm||z.op==Op::BrLocNeImm||z.op==Op::BrLocLtLoc||z.op==Op::BrLocGeLoc||z.op==Op::BrLocGtLoc||z.op==Op::BrLocLeLoc||z.op==Op::BrLocEqLoc||z.op==Op::BrLocNeLoc){push(static_cast<size_t>(z.aux));push(q+1+z.skip);}
             else if(z.op!=Op::Ret)push(q+1+z.skip);
         }
-        PolyLoop pl;pl.exitOp=exitOp;pl.iv=br.a;pl.bound=br.imm;pl.exitPc=exitPc;
+        PolyLoop pl;pl.exitOp=exitOp;pl.iv=br.a;pl.bound=boundSlot>=0?0:br.imm;pl.boundSlot=static_cast<int16_t>(boundSlot);pl.exitPc=exitPc;
         pl.bodyBegin=static_cast<int>(body);pl.bodyEnd=static_cast<int>(j);
         for(int m:mods)if(m>=0&&m<=std::numeric_limits<int16_t>::max())pl.modified.push_back(static_cast<int16_t>(m));else{safe=false;break;}
         for(int m:live)if(m>=0&&m<=std::numeric_limits<int16_t>::max())pl.liveAfter.push_back(static_cast<int16_t>(m));
@@ -601,8 +650,27 @@ static SymExpr symAdd(const SymExpr&a,const SymExpr&b,bool sub=false){
     for(int i=0;i<3;++i)r.p[i]=sub?a.p[i]-b.p[i]:a.p[i]+b.p[i];r.state=a.state;
     for(auto [k,v]:b.state){uint32_t&x=r.state[k];x=sub?x-v:x+v;if(x==0)r.state.erase(k);}return r;
 }
+static bool symIsConstant(const SymExpr& e) {
+    return e.ok && e.state.empty() && e.p[1] == 0 && e.p[2] == 0;
+}
+static SymExpr symScale(const SymExpr& e, uint32_t k) {
+    if (!e.ok) { SymExpr z; z.ok=false; return z; }
+    SymExpr r=e;
+    for (auto& x : r.p) x=static_cast<uint32_t>(static_cast<uint64_t>(x)*k);
+    for (auto it=r.state.begin(); it!=r.state.end();) {
+        it->second=static_cast<uint32_t>(static_cast<uint64_t>(it->second)*k);
+        if (it->second==0) it=r.state.erase(it); else ++it;
+    }
+    return r;
+}
 static SymExpr symMul(const SymExpr&a,const SymExpr&b){
-    if(!a.ok||!b.ok||!a.state.empty()||!b.state.empty()){SymExpr z;z.ok=false;return z;}SymExpr r;
+    if(!a.ok||!b.ok){SymExpr z;z.ok=false;return z;}
+    // Multiplication by a compile-time constant preserves an affine/polynomial
+    // state expression.  This is common in copy/recurrence loops such as
+    // `a = 2*a + b`; the previous evaluator unnecessarily rejected it.
+    if (symIsConstant(a)) return symScale(b,a.p[0]);
+    if (symIsConstant(b)) return symScale(a,b.p[0]);
+    if(!a.state.empty()||!b.state.empty()){SymExpr z;z.ok=false;return z;}SymExpr r;
     std::array<uint32_t,5> q{};for(int i=0;i<3;++i)for(int j=0;j<3;++j)q[i+j]+=static_cast<uint32_t>(static_cast<uint64_t>(a.p[i])*b.p[j]);
     if(q[3]||q[4]){r.ok=false;return r;}r.p[0]=q[0];r.p[1]=q[1];r.p[2]=q[2];return r;
 }
@@ -653,6 +721,62 @@ static uint32_t sumPoly(const std::array<uint32_t,3>&p,int64_t x0,int64_t step,u
     return mul32(p[0],static_cast<uint32_t>(trips))
          + mul32(p[1],sx)
          + mul32(p[2],sx2);
+}
+
+
+// Apply an affine state transition modulo 2^32 by binary exponentiation.
+// Each row describes next_state = M * [state..., 1].  This lets the host
+// evaluator collapse copy chains and mutually-recursive scalar recurrences
+// (e.g. Fibonacci-like loops) in O(k^3 log N) instead of interpreting N trips.
+static bool applyAffineTransition32(
+    const std::vector<int16_t>& slots,
+    const std::vector<SymExpr>& next,
+    int ivSlot,
+    uint64_t trips,
+    std::vector<std::int32_t>& locals) {
+    const size_t m=slots.size();
+    if(m==0 || m>32 || next.size()!=m) return false;
+    std::unordered_map<int,size_t> index;
+    index.reserve(m*2);
+    for(size_t i=0;i<m;++i) index[slots[i]]=i;
+    auto ivIt=index.find(ivSlot); if(ivIt==index.end()) return false;
+    const size_t D=m+1;
+    std::vector<uint32_t> mat(D*D,0), vec(D,0);
+    auto at=[&](std::vector<uint32_t>& a,size_t r,size_t c)->uint32_t&{return a[r*D+c];};
+    for(size_t r=0;r<m;++r){
+        const SymExpr& e=next[r];
+        if(!e.ok || e.p[2]!=0) return false;
+        at(mat,r,D-1)+=e.p[0];
+        at(mat,r,ivIt->second)+=e.p[1];
+        for(const auto& [slot,coeff]:e.state){
+            auto it=index.find(slot); if(it==index.end()) return false;
+            at(mat,r,it->second)+=coeff;
+        }
+    }
+    at(mat,D-1,D-1)=1;
+    for(size_t i=0;i<m;++i){
+        int slot=slots[i]; if(slot<0||slot>=static_cast<int>(locals.size())) return false;
+        vec[i]=static_cast<uint32_t>(locals[slot]);
+    }
+    vec[D-1]=1;
+    auto mulMat=[&](const std::vector<uint32_t>& A,const std::vector<uint32_t>& B){
+        std::vector<uint32_t> C(D*D,0);
+        for(size_t i=0;i<D;++i) for(size_t k=0;k<D;++k){
+            uint32_t aik=A[i*D+k]; if(aik==0) continue;
+            for(size_t j=0;j<D;++j){uint32_t b=B[k*D+j];if(b)C[i*D+j]+=static_cast<uint32_t>(static_cast<uint64_t>(aik)*b);}
+        }
+        return C;
+    };
+    auto mulVec=[&](const std::vector<uint32_t>& A,const std::vector<uint32_t>& x){
+        std::vector<uint32_t> y(D,0);
+        for(size_t i=0;i<D;++i){uint32_t acc=0;for(size_t j=0;j<D;++j)if(A[i*D+j]&&x[j])acc+=static_cast<uint32_t>(static_cast<uint64_t>(A[i*D+j])*x[j]);y[i]=acc;}
+        return y;
+    };
+    std::vector<uint32_t> base=std::move(mat);
+    uint64_t e=trips;
+    while(e){if(e&1)vec=mulVec(base,vec);e>>=1;if(e)base=mulMat(base,base);}
+    for(size_t i=0;i<m;++i) locals[slots[i]]=static_cast<int32_t>(vec[i]);
+    return true;
 }
 
 struct Frame {
@@ -779,15 +903,29 @@ std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
                 if(take) f.pc=static_cast<size_t>(x.aux); else f.pc += x.skip;
                 break;
             }
+            case Op::BrLocLtLoc: case Op::BrLocGeLoc: case Op::BrLocGtLoc:
+            case Op::BrLocLeLoc: case Op::BrLocEqLoc: case Op::BrLocNeLoc: {
+                if(x.a<0||x.a>=static_cast<int>(f.locals.size())||x.b<0||x.b>=static_cast<int>(f.locals.size())) return std::nullopt;
+                int32_t a=f.locals[x.a], b=f.locals[x.b]; bool take=false;
+                if(x.op==Op::BrLocLtLoc) take=a<b;
+                else if(x.op==Op::BrLocGeLoc) take=a>=b;
+                else if(x.op==Op::BrLocGtLoc) take=a>b;
+                else if(x.op==Op::BrLocLeLoc) take=a<=b;
+                else if(x.op==Op::BrLocEqLoc) take=a==b;
+                else take=a!=b;
+                if(take) f.pc=static_cast<size_t>(x.aux); else f.pc += x.skip;
+                break;
+            }
             case Op::FastLinearLoop: {
                 if(x.imm<0||x.imm>=static_cast<int>(fn.fastLoops.size())) return std::nullopt;
                 const auto& L=fn.fastLoops[x.imm];
                 if(L.iv<0||L.iv>=static_cast<int>(f.locals.size())) return std::nullopt;
-                int64_t cur=f.locals[L.iv], bound=L.bound, step=L.step; uint64_t trips=0;
-                if(L.exitOp==Op::BrLocGeImm){ if(cur<bound) trips=static_cast<uint64_t>((bound-cur+step-1)/step); }
-                else if(L.exitOp==Op::BrLocGtImm){ if(cur<=bound) trips=static_cast<uint64_t>((bound-cur)/step+1); }
-                else if(L.exitOp==Op::BrLocLeImm){ int64_t d=-step; if(cur>bound) trips=static_cast<uint64_t>((cur-bound+d-1)/d); }
-                else if(L.exitOp==Op::BrLocLtImm){ int64_t d=-step; if(cur>=bound) trips=static_cast<uint64_t>((cur-bound)/d+1); }
+                if(L.boundSlot>=0 && L.boundSlot>=static_cast<int>(f.locals.size())) return std::nullopt;
+                int64_t cur=f.locals[L.iv], bound=L.boundSlot>=0?f.locals[L.boundSlot]:L.bound, step=L.step; uint64_t trips=0;
+                if(L.exitOp==Op::BrLocGeImm||L.exitOp==Op::BrLocGeLoc){ if(cur<bound) trips=static_cast<uint64_t>((bound-cur+step-1)/step); }
+                else if(L.exitOp==Op::BrLocGtImm||L.exitOp==Op::BrLocGtLoc){ if(cur<=bound) trips=static_cast<uint64_t>((bound-cur)/step+1); }
+                else if(L.exitOp==Op::BrLocLeImm||L.exitOp==Op::BrLocLeLoc){ int64_t d=-step; if(cur>bound) trips=static_cast<uint64_t>((cur-bound+d-1)/d); }
+                else if(L.exitOp==Op::BrLocLtImm||L.exitOp==Op::BrLocLtLoc){ int64_t d=-step; if(cur>=bound) trips=static_cast<uint64_t>((cur-bound)/d+1); }
                 const int64_t iv0=cur;
                 const uint32_t sumIv=progressionSum32(iv0,step,trips);
                 auto pow32=[](uint32_t base,uint64_t e){uint32_t r=1;while(e){if(e&1)r=static_cast<uint32_t>(static_cast<uint64_t>(r)*base);base=static_cast<uint32_t>(static_cast<uint64_t>(base)*base);e>>=1;}return r;};
@@ -810,11 +948,13 @@ std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
                 if(x.imm<0||x.imm>=static_cast<int>(fn.polyLoops.size())) return std::nullopt;
                 const auto& L=fn.polyLoops[x.imm];
                 if(L.iv<0||L.iv>=static_cast<int>(f.locals.size())) return std::nullopt;
+                if(L.boundSlot>=0 && L.boundSlot>=static_cast<int>(f.locals.size())) return std::nullopt;
+                const int32_t loopBound=L.boundSlot>=0?f.locals[L.boundSlot]:L.bound;
                 auto branchTake=[&](int32_t v){
-                    if(L.exitOp==Op::BrLocLtImm)return v<L.bound;
-                    if(L.exitOp==Op::BrLocGeImm)return v>=L.bound;
-                    if(L.exitOp==Op::BrLocGtImm)return v>L.bound;
-                    return v<=L.bound;
+                    if(L.exitOp==Op::BrLocLtImm||L.exitOp==Op::BrLocLtLoc)return v<loopBound;
+                    if(L.exitOp==Op::BrLocGeImm||L.exitOp==Op::BrLocGeLoc)return v>=loopBound;
+                    if(L.exitOp==Op::BrLocGtImm||L.exitOp==Op::BrLocGtLoc)return v>loopBound;
+                    return v<=loopBound;
                 };
                 if(branchTake(f.locals[L.iv])){f.pc=static_cast<size_t>(L.exitPc);break;}
                 std::unordered_set<int> modified(L.modified.begin(),L.modified.end());
@@ -854,18 +994,29 @@ std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
                 }
                 int64_t step=0;
                 if(ok){const SymExpr& ie=loc[L.iv];if(!ie.state.empty()||ie.p[2]!=0||ie.p[1]!=1)ok=false;else step=static_cast<int32_t>(ie.p[0]);if(step==0)ok=false;}
-                bool dir=ok&&(((L.exitOp==Op::BrLocGeImm||L.exitOp==Op::BrLocGtImm)&&step>0)||((L.exitOp==Op::BrLocLeImm||L.exitOp==Op::BrLocLtImm)&&step<0));
+                bool dir=ok&&(((L.exitOp==Op::BrLocGeImm||L.exitOp==Op::BrLocGtImm||L.exitOp==Op::BrLocGeLoc||L.exitOp==Op::BrLocGtLoc)&&step>0)||((L.exitOp==Op::BrLocLeImm||L.exitOp==Op::BrLocLtImm||L.exitOp==Op::BrLocLeLoc||L.exitOp==Op::BrLocLtLoc)&&step<0));
                 if(!dir){
                     // Fall back to the original branch semantics; body bytecode is unchanged.
                     f.pc=static_cast<size_t>(L.bodyBegin);break;
                 }
-                int64_t cur=f.locals[L.iv],bound=L.bound;uint64_t trips=0;
-                if(L.exitOp==Op::BrLocGeImm){if(cur<bound)trips=(bound-cur+step-1)/step;}
-                else if(L.exitOp==Op::BrLocGtImm){if(cur<=bound)trips=(bound-cur)/step+1;}
-                else if(L.exitOp==Op::BrLocLeImm){int64_t d=-step;if(cur>bound)trips=(cur-bound+d-1)/d;}
+                int64_t cur=f.locals[L.iv],bound=loopBound;uint64_t trips=0;
+                if(L.exitOp==Op::BrLocGeImm||L.exitOp==Op::BrLocGeLoc){if(cur<bound)trips=(bound-cur+step-1)/step;}
+                else if(L.exitOp==Op::BrLocGtImm||L.exitOp==Op::BrLocGtLoc){if(cur<=bound)trips=(bound-cur)/step+1;}
+                else if(L.exitOp==Op::BrLocLeImm||L.exitOp==Op::BrLocLeLoc){int64_t d=-step;if(cur>bound)trips=(cur-bound+d-1)/d;}
                 else {int64_t d=-step;if(cur>=bound)trips=(cur-bound)/d+1;}
                 if(trips==0){f.pc=static_cast<size_t>(L.exitPc);break;}
                 const int64_t lastX=cur+static_cast<int64_t>(trips-1)*step;
+                // First try the general affine transition.  Unlike the older
+                // per-slot formulas, it permits values to move between locals
+                // from one iteration to the next (copy chains, rotations,
+                // Fibonacci-like recurrences, linear state machines).  X is the
+                // loop-header induction variable, so p1 maps to the iv column.
+                std::vector<SymExpr> affineNext; affineNext.reserve(L.modified.size());
+                for(int slot:L.modified) affineNext.push_back(loc[slot]);
+                if(applyAffineTransition32(L.modified,affineNext,L.iv,trips,f.locals)){
+                    f.pc=static_cast<size_t>(L.exitPc);break;
+                }
+
                 std::unordered_set<int> liveAfter(L.liveAfter.begin(),L.liveAfter.end());
                 for(int slot:L.modified){if(slot==L.iv||!liveAfter.count(slot))continue;const SymExpr&e=loc[slot];
                     if(!e.ok){ok=false;break;}
