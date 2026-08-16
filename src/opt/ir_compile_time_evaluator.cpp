@@ -1,5 +1,7 @@
 #include "opt/ir_compile_time_evaluator.h"
 
+#include <algorithm>
+
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -14,6 +16,14 @@
 namespace toycc {
 namespace {
 
+#if defined(_MSC_VER)
+#define TOYCC_EVAL_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define TOYCC_EVAL_NOINLINE __attribute__((noinline))
+#else
+#define TOYCC_EVAL_NOINLINE
+#endif
+
 enum class Op : std::uint8_t {
     Nop, Li, Load, Store, LoadArg, StoreArg, LoadGlobal, StoreGlobal,
     Mv, Add, Sub, Mul, Div, Rem, Slt, Seqz, Snez,
@@ -25,7 +35,7 @@ enum class Op : std::uint8_t {
     AddMulLocImm, SubMulLocImm, AddMulLocLoc, SubMulLocLoc,
     BrLocLtImm, BrLocGeImm, BrLocGtImm, BrLocLeImm, BrLocEqImm, BrLocNeImm,
     BrLocLtLoc, BrLocGeLoc, BrLocGtLoc, BrLocLeLoc, BrLocEqLoc, BrLocNeLoc,
-    FastLinearLoop, FastPolyLoop
+    FastLinearLoop, FastPolyLoop, FastPeriodicLoop
 };
 
 constexpr int R_T0 = 0;
@@ -69,10 +79,24 @@ struct PolyLoop {
     std::vector<std::int16_t> modified;
     std::vector<std::int16_t> liveAfter;
 };
+struct PeriodicLoop {
+    Op exitOp=Op::BrLocGeImm;
+    std::int16_t iv=-1;
+    std::int32_t bound=0;
+    std::int16_t boundSlot=-1;
+    std::int32_t exitPc=0;
+    std::int32_t bodyBegin=0;
+    std::int32_t bodyEnd=0;
+    std::vector<std::int16_t> modified;
+    // Header-state residues which completely determine every internal branch.
+    // The C/C++ signed remainder is used directly, so negative values remain distinct.
+    std::vector<std::pair<std::int16_t,std::int32_t>> residueKeys;
+};
 struct Fn {
     std::vector<BC> code;
     std::vector<FastLoop> fastLoops;
     std::vector<PolyLoop> polyLoops;
+    std::vector<PeriodicLoop> periodicLoops;
     int localWords = 0;
     int outgoingWords = 0;
     int paramCount = 0;
@@ -238,6 +262,28 @@ void fuseSuperInstructions(Fn& fn) {
             bool wantEq=branchOnTrue?exprEq:!exprEq;
             BC y;y.op=wantEq?Op::BrLocEqLoc:Op::BrLocNeLoc;
             y.a=static_cast<int16_t>(c[i+1].imm);y.b=static_cast<int16_t>(c[i].imm);y.aux=c[i+4].imm;y.skip=4;c[i]=y;continue;
+        }
+
+        // Truthiness/equality-to-zero branch on a loaded local.  IRBuilder
+        // often materializes `if (x)` / `if (!x)` as LOAD->MV->SEQZ/SNEZ->BRANCH;
+        // fusing it is important both for evaluator throughput and for the
+        // periodic-loop recognizer, which reasons about local remainder slots.
+        if (i + 3 < n && is(i,Op::Load) && c[i].d==1 &&
+            is(i+1,Op::Mv) && c[i+1].d==R_T0 && c[i+1].a==1 &&
+            (is(i+2,Op::Seqz)||is(i+2,Op::Snez)) && c[i+2].d==R_T0 && c[i+2].a==R_T0 &&
+            (is(i+3,Op::Bz)||is(i+3,Op::Bnz)) && c[i+3].a==R_T0) {
+            bool exprEq=is(i+2,Op::Seqz), branchOnTrue=is(i+3,Op::Bnz);
+            bool wantEq=branchOnTrue?exprEq:!exprEq;
+            BC y;y.op=wantEq?Op::BrLocEqImm:Op::BrLocNeImm;
+            y.a=static_cast<int16_t>(c[i].imm);y.imm=0;y.aux=c[i+3].imm;y.skip=3;c[i]=y;continue;
+        }
+        if (i + 2 < n && is(i,Op::Load) && c[i].d==R_T0 &&
+            (is(i+1,Op::Seqz)||is(i+1,Op::Snez)) && c[i+1].d==R_T0 && c[i+1].a==R_T0 &&
+            (is(i+2,Op::Bz)||is(i+2,Op::Bnz)) && c[i+2].a==R_T0) {
+            bool exprEq=is(i+1,Op::Seqz), branchOnTrue=is(i+2,Op::Bnz);
+            bool wantEq=branchOnTrue?exprEq:!exprEq;
+            BC y;y.op=wantEq?Op::BrLocEqImm:Op::BrLocNeImm;
+            y.a=static_cast<int16_t>(c[i].imm);y.imm=0;y.aux=c[i+2].imm;y.skip=2;c[i]=y;continue;
         }
 
         // LI rhs ; LOAD lhs ; SUB t0,t1,t0 ; SEQZ/SNEZ ; BRANCH
@@ -502,6 +548,136 @@ void fusePolynomialLoops(Fn& fn) {
     }
 }
 
+
+// Recognize a conservative class of branchy natural loops whose internal
+// control flow is driven only by constant-modulus remainders.  The ordinary
+// polynomial summarizer intentionally rejects internal branches; this metadata
+// lets the runtime evaluator discover the short remainder period and compose
+// one whole period symbolically.  It is deliberately evaluator-only: failure
+// simply leaves the original bytecode untouched for normal interpretation.
+TOYCC_EVAL_NOINLINE void fusePeriodicLoops(Fn& fn) {
+    auto& c=fn.code; const size_t n=c.size();
+    auto next=[&](size_t& k){while(k<n&&c[k].op==Op::Nop)++k;};
+    auto isHeaderBranch=[](Op o){return o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm||o==Op::BrLocLtLoc||o==Op::BrLocGeLoc||o==Op::BrLocGtLoc||o==Op::BrLocLeLoc;};
+    auto isAnyBranch=[](Op o){return o==Op::Bz||o==Op::Bnz||o==Op::BrLocLtImm||o==Op::BrLocGeImm||o==Op::BrLocGtImm||o==Op::BrLocLeImm||o==Op::BrLocEqImm||o==Op::BrLocNeImm||o==Op::BrLocLtLoc||o==Op::BrLocGeLoc||o==Op::BrLocGtLoc||o==Op::BrLocLeLoc||o==Op::BrLocEqLoc||o==Op::BrLocNeLoc;};
+
+    for(size_t j=0;j<n;++j){
+        if(c[j].op!=Op::Jump||c[j].imm<0||static_cast<size_t>(c[j].imm)>=j) continue;
+        const size_t h=static_cast<size_t>(c[j].imm);
+        size_t k=h; next(k);
+        if(k>=j||c[k].op==Op::FastLinearLoop||c[k].op==Op::FastPolyLoop||c[k].op==Op::FastPeriodicLoop||!isHeaderBranch(c[k].op)) continue;
+        const BC br=c[k];
+        if(br.aux<=static_cast<int>(j)||br.aux<0) continue; // ordinary while layout only
+        int boundSlot=(br.op==Op::BrLocLtLoc||br.op==Op::BrLocGeLoc||br.op==Op::BrLocGtLoc||br.op==Op::BrLocLeLoc)?br.b:-1;
+        size_t body=k+1+br.skip; next(body); if(body>=j) continue;
+
+        bool safe=true, sawInternalBranch=false, afterBranch=false;
+        std::unordered_set<int> mods, remDests;
+        // Dependency of a local/register on header locals before the first
+        // internal branch. This is enough for the common `(iv+invariant)%C`
+        // and `state%C` predicates while staying conservative across joins.
+        std::vector<std::unordered_set<int>> ldeps(static_cast<size_t>(std::max(0,fn.localWords)));
+        for(size_t z=0;z<ldeps.size();++z) ldeps[z].insert(static_cast<int>(z));
+        std::array<std::unordered_set<int>,REG_COUNT> rdeps;
+        std::vector<std::pair<int,int32_t>> requirements;
+        auto validSlot=[&](int z){return z>=0&&z<static_cast<int>(ldeps.size());};
+        auto merge=[](std::unordered_set<int> a,const std::unordered_set<int>&b){a.insert(b.begin(),b.end());return a;};
+
+        for(size_t q=body;q<j;){
+            next(q); if(q>=j) break; const BC& x=c[q];
+            if(x.op==Op::Jump){
+                if(x.imm<0||static_cast<size_t>(x.imm)<=q||static_cast<size_t>(x.imm)>=j){safe=false;break;}
+                afterBranch=true; q+=1+x.skip; continue;
+            }
+            if(isAnyBranch(x.op)){
+                // Internal branches must consume a remainder slot directly.
+                // This guarantees that repeating the recorded residue key
+                // repeats the branch path; arbitrary threshold/state branches
+                // remain on the proven v14 interpreter path.
+                int a=-1,b=-1;
+                if(x.op==Op::Bz||x.op==Op::Bnz){safe=false;break;}
+                a=x.a;
+                if(x.op==Op::BrLocLtLoc||x.op==Op::BrLocGeLoc||x.op==Op::BrLocGtLoc||x.op==Op::BrLocLeLoc||x.op==Op::BrLocEqLoc||x.op==Op::BrLocNeLoc)b=x.b;
+                if(!remDests.count(a) && (b<0||!remDests.count(b))){safe=false;break;}
+                const int target = x.aux;
+                if(target<=static_cast<int>(q)||target>=static_cast<int>(j)){safe=false;break;}
+                sawInternalBranch=true; afterBranch=true; q+=1+x.skip; continue;
+            }
+            switch(x.op){
+                case Op::Nop: break;
+                case Op::Li: if(!afterBranch&&x.d>=0)rdeps[x.d].clear(); break;
+                case Op::Load: if(!afterBranch&&x.d>=0&&validSlot(x.imm))rdeps[x.d]=ldeps[x.imm]; break;
+                case Op::Store:
+                    if(x.imm>=0)mods.insert(x.imm);
+                    if(!afterBranch&&validSlot(x.imm)&&x.a>=0)ldeps[x.imm]=rdeps[x.a];
+                    break;
+                case Op::Mv: if(!afterBranch&&x.d>=0&&x.a>=0)rdeps[x.d]=rdeps[x.a]; break;
+                case Op::Add:
+                    if(!afterBranch&&x.d>=0&&x.a>=0&&x.b>=0)rdeps[x.d]=merge(rdeps[x.a],rdeps[x.b]); break;
+                case Op::Sub:
+                    if(!afterBranch&&x.d>=0)rdeps[x.d].clear(); break;
+                case Op::Mul:
+                    if(!afterBranch&&x.d>=0&&x.a>=0&&x.b>=0)rdeps[x.d]=merge(rdeps[x.a],rdeps[x.b]); break;
+                case Op::StoreImm:
+                    if(x.d>=0)mods.insert(x.d);
+                    if(!afterBranch&&validSlot(x.d))ldeps[x.d].clear(); break;
+                case Op::CopyLocal:
+                    if(x.d>=0)mods.insert(x.d);
+                    if(!afterBranch&&validSlot(x.d)&&validSlot(x.a))ldeps[x.d]=ldeps[x.a]; break;
+                case Op::AddLocImm: case Op::SubLocImm: case Op::MulLocImm:
+                    if(x.d>=0)mods.insert(x.d);
+                    if(!afterBranch&&validSlot(x.d)&&validSlot(x.a)) {
+                        if((x.op==Op::AddLocImm&&x.imm>=0)||(x.op==Op::MulLocImm&&x.imm>=0))ldeps[x.d]=ldeps[x.a];
+                        else ldeps[x.d].clear();
+                    }
+                    break;
+                case Op::AddLocLoc: case Op::SubLocLoc:
+                    if(x.d>=0)mods.insert(x.d);
+                    if(!afterBranch&&validSlot(x.d)&&validSlot(x.a)&&validSlot(x.b)) {
+                        if(x.op==Op::AddLocLoc)ldeps[x.d]=merge(ldeps[x.a],ldeps[x.b]);else ldeps[x.d].clear();
+                    }
+                    break;
+                case Op::MulLocLoc:
+                    if(x.d>=0)mods.insert(x.d);
+                    if(!afterBranch&&validSlot(x.d)&&validSlot(x.a)&&validSlot(x.b))ldeps[x.d]=merge(ldeps[x.a],ldeps[x.b]); break;
+                case Op::RemLocImm: {
+                    if(x.d>=0)mods.insert(x.d);
+                    if(x.imm<=0||x.imm>4096||!validSlot(x.a)){safe=false;break;}
+                    if(!afterBranch){
+                        remDests.insert(x.d);
+                        for(int dep:ldeps[x.a]) requirements.push_back({dep,x.imm});
+                        if(validSlot(x.d)) ldeps[x.d]=ldeps[x.a];
+                    }
+                    break;
+                }
+                case Op::DivLocImm: case Op::DivLocLoc: case Op::RemLocLoc:
+                case Op::AddMulLocImm: case Op::SubMulLocImm:
+                case Op::AddMulLocLoc: case Op::SubMulLocLoc:
+                    if(x.d>=0)mods.insert(x.d);
+                    break;
+                case Op::LoadArg: case Op::StoreArg: case Op::LoadGlobal: case Op::StoreGlobal:
+                case Op::Call: case Op::Ret: case Op::FastLinearLoop: case Op::FastPolyLoop: case Op::FastPeriodicLoop:
+                    safe=false; break;
+                default: break;
+            }
+            if(!safe)break;
+            q+=1+x.skip;
+        }
+        if(!safe||!sawInternalBranch||requirements.empty()||!mods.count(br.a)) continue;
+        if(boundSlot>=0&&mods.count(boundSlot))continue;
+        // Canonicalize duplicate residue requirements.
+        std::sort(requirements.begin(),requirements.end());
+        requirements.erase(std::unique(requirements.begin(),requirements.end()),requirements.end());
+        if(requirements.size()>16)continue;
+        PeriodicLoop pl;pl.exitOp=br.op;pl.iv=br.a;pl.bound=boundSlot>=0?0:br.imm;pl.boundSlot=static_cast<int16_t>(boundSlot);pl.exitPc=br.aux;
+        pl.bodyBegin=static_cast<int>(body);pl.bodyEnd=static_cast<int>(j);
+        for(int m:mods){if(m<0||m>std::numeric_limits<int16_t>::max()){safe=false;break;}pl.modified.push_back(static_cast<int16_t>(m));}
+        for(auto [slot,mod]:requirements){if(slot<0||slot>std::numeric_limits<int16_t>::max()){safe=false;break;}pl.residueKeys.push_back({static_cast<int16_t>(slot),mod});}
+        if(!safe)continue;
+        int idx=static_cast<int>(fn.periodicLoops.size());fn.periodicLoops.push_back(std::move(pl));BC y;y.op=Op::FastPeriodicLoop;y.imm=idx;c[k]=y;
+    }
+}
+
 bool compileProgram(const IRProgram& p, Compiled& out) {
     std::unordered_map<std::string, int> fids;
     fids.reserve(p.functions.size() * 2 + 1);
@@ -594,6 +770,7 @@ bool compileProgram(const IRProgram& p, Compiled& out) {
         fuseSuperInstructions(dst);
         fuseLinearLoops(dst);
         fusePolynomialLoops(dst);
+        fusePeriodicLoops(dst);
     }
     // A function is memoizable only if it has no global access and every
     // function it calls is likewise pure. Starting from the local property
@@ -792,6 +969,147 @@ struct Frame {
 
 } // namespace
 
+
+static bool periodicExitTaken(Op op, int32_t a, int32_t b) {
+    if(op==Op::BrLocLtImm||op==Op::BrLocLtLoc) return a<b;
+    if(op==Op::BrLocGeImm||op==Op::BrLocGeLoc) return a>=b;
+    if(op==Op::BrLocGtImm||op==Op::BrLocGtLoc) return a>b;
+    if(op==Op::BrLocLeImm||op==Op::BrLocLeLoc) return a<=b;
+    return false;
+}
+
+static std::optional<uint64_t> periodicTripCount(Op op,int32_t cur,int32_t bound,int64_t step){
+    if(step==0)return std::nullopt;
+    const int64_t c=cur,b=bound;
+    if(op==Op::BrLocGeImm||op==Op::BrLocGeLoc){
+        if(c>=b)return uint64_t{0}; if(step<=0)return std::nullopt;
+        return static_cast<uint64_t>((b-c+step-1)/step);
+    }
+    if(op==Op::BrLocGtImm||op==Op::BrLocGtLoc){
+        if(c>b)return uint64_t{0}; if(step<=0)return std::nullopt;
+        return static_cast<uint64_t>((b-c)/step+1);
+    }
+    if(op==Op::BrLocLeImm||op==Op::BrLocLeLoc){
+        if(c<=b)return uint64_t{0}; if(step>=0)return std::nullopt; const int64_t d=-step;
+        return static_cast<uint64_t>((c-b+d-1)/d);
+    }
+    if(op==Op::BrLocLtImm||op==Op::BrLocLtLoc){
+        if(c<b)return uint64_t{0}; if(step>=0)return std::nullopt; const int64_t d=-step;
+        return static_cast<uint64_t>((c-b)/d+1);
+    }
+    return std::nullopt;
+}
+
+// Execute one branchy loop body on concrete locals. The metadata builder
+// guarantees that every control transfer is forward and stays inside the body.
+static TOYCC_EVAL_NOINLINE bool runPeriodicConcrete(const Fn& fn,const PeriodicLoop& L,
+                                std::vector<int32_t>& loc,
+                                std::array<int32_t,REG_COUNT>& rr){
+    size_t pc=static_cast<size_t>(L.bodyBegin); const size_t end=static_cast<size_t>(L.bodyEnd);
+    auto valid=[&](int z){return z>=0&&z<static_cast<int>(loc.size());};
+    size_t guard=0;
+    while(pc<end){
+        if(++guard>static_cast<size_t>(L.bodyEnd-L.bodyBegin+8)*4u)return false;
+        const BC q=fn.code[pc]; size_t nextPc=pc+1+q.skip;
+        switch(q.op){
+            case Op::Nop: break;
+            case Op::Li: if(q.d<0||q.d>=REG_COUNT)return false;rr[q.d]=q.imm;break;
+            case Op::Load: if(q.d<0||q.d>=REG_COUNT||!valid(q.imm))return false;rr[q.d]=loc[q.imm];break;
+            case Op::Store: if(q.a<0||q.a>=REG_COUNT||!valid(q.imm))return false;loc[q.imm]=rr[q.a];break;
+            case Op::Mv: if(q.d<0||q.d>=REG_COUNT||q.a<0||q.a>=REG_COUNT)return false;rr[q.d]=rr[q.a];break;
+            case Op::Add: case Op::Sub: case Op::Mul:{
+                if(q.d<0||q.d>=REG_COUNT||q.a<0||q.a>=REG_COUNT||q.b<0||q.b>=REG_COUNT)return false;
+                uint32_t a=static_cast<uint32_t>(rr[q.a]),b=static_cast<uint32_t>(rr[q.b]);
+                rr[q.d]=static_cast<int32_t>(q.op==Op::Add?a+b:q.op==Op::Sub?a-b:static_cast<uint32_t>(static_cast<uint64_t>(a)*b));break;}
+            case Op::Div:{if(q.d<0||q.a<0||q.b<0)return false;int32_t z;if(!checkedDiv(rr[q.a],rr[q.b],z))return false;rr[q.d]=z;break;}
+            case Op::Rem:{if(q.d<0||q.a<0||q.b<0||rr[q.b]==0)return false;int32_t a=rr[q.a],b=rr[q.b];rr[q.d]=(a==std::numeric_limits<int32_t>::min()&&b==-1)?0:a%b;break;}
+            case Op::Slt: if(q.d<0||q.a<0||q.b<0)return false;rr[q.d]=rr[q.a]<rr[q.b]?1:0;break;
+            case Op::Seqz: if(q.d<0||q.a<0)return false;rr[q.d]=rr[q.a]==0?1:0;break;
+            case Op::Snez: if(q.d<0||q.a<0)return false;rr[q.d]=rr[q.a]!=0?1:0;break;
+            case Op::StoreImm: if(!valid(q.d))return false;loc[q.d]=q.imm;break;
+            case Op::CopyLocal: if(!valid(q.a)||!valid(q.d))return false;loc[q.d]=loc[q.a];break;
+            case Op::AddLocImm: case Op::SubLocImm: case Op::MulLocImm: case Op::DivLocImm: case Op::RemLocImm:{
+                if(!valid(q.a)||!valid(q.d))return false;int32_t a=loc[q.a],r=0;
+                if(q.op==Op::AddLocImm)r=static_cast<int32_t>(static_cast<uint32_t>(a)+static_cast<uint32_t>(q.imm));
+                else if(q.op==Op::SubLocImm)r=static_cast<int32_t>(static_cast<uint32_t>(a)-static_cast<uint32_t>(q.imm));
+                else if(q.op==Op::MulLocImm)r=static_cast<int32_t>(static_cast<uint32_t>(a)*static_cast<uint32_t>(q.imm));
+                else if(q.op==Op::DivLocImm){if(!checkedDiv(a,q.imm,r))return false;}
+                else {if(q.imm==0)return false;r=(a==std::numeric_limits<int32_t>::min()&&q.imm==-1)?0:a%q.imm;}
+                loc[q.d]=r;break;}
+            case Op::AddLocLoc: case Op::SubLocLoc: case Op::MulLocLoc: case Op::DivLocLoc: case Op::RemLocLoc:{
+                if(!valid(q.a)||!valid(q.b)||!valid(q.d))return false;int32_t a=loc[q.a],b=loc[q.b],r=0;
+                if(q.op==Op::AddLocLoc)r=static_cast<int32_t>(static_cast<uint32_t>(a)+static_cast<uint32_t>(b));
+                else if(q.op==Op::SubLocLoc)r=static_cast<int32_t>(static_cast<uint32_t>(a)-static_cast<uint32_t>(b));
+                else if(q.op==Op::MulLocLoc)r=static_cast<int32_t>(static_cast<uint32_t>(a)*static_cast<uint32_t>(b));
+                else if(q.op==Op::DivLocLoc){if(!checkedDiv(a,b,r))return false;}
+                else {if(b==0)return false;r=(a==std::numeric_limits<int32_t>::min()&&b==-1)?0:a%b;}
+                loc[q.d]=r;break;}
+            case Op::AddMulLocImm: case Op::SubMulLocImm:{if(!valid(q.a)||!valid(q.d))return false;uint32_t p=mul32(static_cast<uint32_t>(loc[q.a]),static_cast<uint32_t>(q.imm));uint32_t a=static_cast<uint32_t>(loc[q.d]);loc[q.d]=static_cast<int32_t>(q.op==Op::AddMulLocImm?a+p:a-p);break;}
+            case Op::AddMulLocLoc: case Op::SubMulLocLoc:{if(!valid(q.a)||!valid(q.b)||!valid(q.d))return false;uint32_t p=mul32(static_cast<uint32_t>(loc[q.a]),static_cast<uint32_t>(loc[q.b]));uint32_t a=static_cast<uint32_t>(loc[q.d]);loc[q.d]=static_cast<int32_t>(q.op==Op::AddMulLocLoc?a+p:a-p);break;}
+            case Op::BrLocLtImm: case Op::BrLocGeImm: case Op::BrLocGtImm: case Op::BrLocLeImm: case Op::BrLocEqImm: case Op::BrLocNeImm:{
+                if(!valid(q.a))return false;int32_t a=loc[q.a];bool take=q.op==Op::BrLocLtImm?a<q.imm:q.op==Op::BrLocGeImm?a>=q.imm:q.op==Op::BrLocGtImm?a>q.imm:q.op==Op::BrLocLeImm?a<=q.imm:q.op==Op::BrLocEqImm?a==q.imm:a!=q.imm;if(take)nextPc=static_cast<size_t>(q.aux);break;}
+            case Op::BrLocLtLoc: case Op::BrLocGeLoc: case Op::BrLocGtLoc: case Op::BrLocLeLoc: case Op::BrLocEqLoc: case Op::BrLocNeLoc:{
+                if(!valid(q.a)||!valid(q.b))return false;int32_t a=loc[q.a],b=loc[q.b];bool take=q.op==Op::BrLocLtLoc?a<b:q.op==Op::BrLocGeLoc?a>=b:q.op==Op::BrLocGtLoc?a>b:q.op==Op::BrLocLeLoc?a<=b:q.op==Op::BrLocEqLoc?a==b:a!=b;if(take)nextPc=static_cast<size_t>(q.aux);break;}
+            case Op::Jump: nextPc=static_cast<size_t>(q.imm);break;
+            default:return false;
+        }
+        if(nextPc<static_cast<size_t>(L.bodyBegin)||nextPc>static_cast<size_t>(L.bodyEnd))return false;
+        pc=nextPc;
+    }
+    return pc==end;
+}
+
+// Replay a fixed, already-proven remainder period symbolically. Branches are
+// selected by the concrete companion state; remainder temporaries themselves
+// are phase constants across repeated periods and are therefore represented as
+// constants in the symbolic state.
+static TOYCC_EVAL_NOINLINE bool runPeriodicSymbolic(const Fn& fn,const PeriodicLoop& L,uint64_t iterations,
+                                std::vector<int32_t>& concrete,
+                                std::array<int32_t,REG_COUNT>& cr,
+                                std::vector<SymExpr>& sloc,
+                                std::array<SymExpr,REG_COUNT>& sr){
+    auto valid=[&](int z){return z>=0&&z<static_cast<int>(concrete.size());};
+    for(uint64_t it=0;it<iterations;++it){
+        size_t pc=static_cast<size_t>(L.bodyBegin),end=static_cast<size_t>(L.bodyEnd),guard=0;
+        while(pc<end){
+            if(++guard>static_cast<size_t>(L.bodyEnd-L.bodyBegin+8)*4u)return false;
+            const BC q=fn.code[pc];size_t nextPc=pc+1+q.skip;
+            auto needReg=[&](int z){return z>=0&&z<REG_COUNT&&sr[z].ok;};
+            switch(q.op){
+                case Op::Nop:break;
+                case Op::Li:cr[q.d]=q.imm;sr[q.d]=symConst(q.imm);break;
+                case Op::Load:if(!valid(q.imm))return false;cr[q.d]=concrete[q.imm];sr[q.d]=sloc[q.imm];break;
+                case Op::Store:if(!valid(q.imm)||!needReg(q.a))return false;concrete[q.imm]=cr[q.a];sloc[q.imm]=sr[q.a];break;
+                case Op::Mv:if(!needReg(q.a))return false;cr[q.d]=cr[q.a];sr[q.d]=sr[q.a];break;
+                case Op::Add:case Op::Sub:case Op::Mul:{if(!needReg(q.a)||!needReg(q.b))return false;uint32_t a=static_cast<uint32_t>(cr[q.a]),b=static_cast<uint32_t>(cr[q.b]);cr[q.d]=static_cast<int32_t>(q.op==Op::Add?a+b:q.op==Op::Sub?a-b:mul32(a,b));sr[q.d]=q.op==Op::Add?symAdd(sr[q.a],sr[q.b]):q.op==Op::Sub?symAdd(sr[q.a],sr[q.b],true):symMul(sr[q.a],sr[q.b]);if(!sr[q.d].ok)return false;break;}
+                case Op::StoreImm:if(!valid(q.d))return false;concrete[q.d]=q.imm;sloc[q.d]=symConst(q.imm);break;
+                case Op::CopyLocal:if(!valid(q.a)||!valid(q.d))return false;concrete[q.d]=concrete[q.a];sloc[q.d]=sloc[q.a];break;
+                case Op::AddLocImm:case Op::SubLocImm:case Op::MulLocImm:{if(!valid(q.a)||!valid(q.d))return false;auto imm=symConst(q.imm);uint32_t a=static_cast<uint32_t>(concrete[q.a]);concrete[q.d]=static_cast<int32_t>(q.op==Op::AddLocImm?a+static_cast<uint32_t>(q.imm):q.op==Op::SubLocImm?a-static_cast<uint32_t>(q.imm):mul32(a,static_cast<uint32_t>(q.imm)));sloc[q.d]=q.op==Op::AddLocImm?symAdd(sloc[q.a],imm):q.op==Op::SubLocImm?symAdd(sloc[q.a],imm,true):symMul(sloc[q.a],imm);if(!sloc[q.d].ok)return false;break;}
+                case Op::AddLocLoc:case Op::SubLocLoc:case Op::MulLocLoc:{if(!valid(q.a)||!valid(q.b)||!valid(q.d))return false;uint32_t a=static_cast<uint32_t>(concrete[q.a]),b=static_cast<uint32_t>(concrete[q.b]);concrete[q.d]=static_cast<int32_t>(q.op==Op::AddLocLoc?a+b:q.op==Op::SubLocLoc?a-b:mul32(a,b));sloc[q.d]=q.op==Op::AddLocLoc?symAdd(sloc[q.a],sloc[q.b]):q.op==Op::SubLocLoc?symAdd(sloc[q.a],sloc[q.b],true):symMul(sloc[q.a],sloc[q.b]);if(!sloc[q.d].ok)return false;break;}
+                case Op::RemLocImm:{if(!valid(q.a)||!valid(q.d)||q.imm==0)return false;int32_t a=concrete[q.a];int32_t r=(a==std::numeric_limits<int32_t>::min()&&q.imm==-1)?0:a%q.imm;concrete[q.d]=r;sloc[q.d]=symConst(r);break;}
+                case Op::AddMulLocImm:case Op::SubMulLocImm:{if(!valid(q.a)||!valid(q.d))return false;uint32_t p=mul32(static_cast<uint32_t>(concrete[q.a]),static_cast<uint32_t>(q.imm));uint32_t a=static_cast<uint32_t>(concrete[q.d]);concrete[q.d]=static_cast<int32_t>(q.op==Op::AddMulLocImm?a+p:a-p);auto prod=symMul(sloc[q.a],symConst(q.imm));sloc[q.d]=q.op==Op::AddMulLocImm?symAdd(sloc[q.d],prod):symAdd(sloc[q.d],prod,true);if(!sloc[q.d].ok)return false;break;}
+                case Op::AddMulLocLoc:case Op::SubMulLocLoc:{if(!valid(q.a)||!valid(q.b)||!valid(q.d))return false;uint32_t p=mul32(static_cast<uint32_t>(concrete[q.a]),static_cast<uint32_t>(concrete[q.b]));uint32_t a=static_cast<uint32_t>(concrete[q.d]);concrete[q.d]=static_cast<int32_t>(q.op==Op::AddMulLocLoc?a+p:a-p);auto prod=symMul(sloc[q.a],sloc[q.b]);sloc[q.d]=q.op==Op::AddMulLocLoc?symAdd(sloc[q.d],prod):symAdd(sloc[q.d],prod,true);if(!sloc[q.d].ok)return false;break;}
+                case Op::BrLocLtImm:case Op::BrLocGeImm:case Op::BrLocGtImm:case Op::BrLocLeImm:case Op::BrLocEqImm:case Op::BrLocNeImm:{if(!valid(q.a))return false;int32_t a=concrete[q.a];bool take=q.op==Op::BrLocLtImm?a<q.imm:q.op==Op::BrLocGeImm?a>=q.imm:q.op==Op::BrLocGtImm?a>q.imm:q.op==Op::BrLocLeImm?a<=q.imm:q.op==Op::BrLocEqImm?a==q.imm:a!=q.imm;if(take)nextPc=static_cast<size_t>(q.aux);break;}
+                case Op::BrLocLtLoc:case Op::BrLocGeLoc:case Op::BrLocGtLoc:case Op::BrLocLeLoc:case Op::BrLocEqLoc:case Op::BrLocNeLoc:{if(!valid(q.a)||!valid(q.b))return false;int32_t a=concrete[q.a],b=concrete[q.b];bool take=q.op==Op::BrLocLtLoc?a<b:q.op==Op::BrLocGeLoc?a>=b:q.op==Op::BrLocGtLoc?a>b:q.op==Op::BrLocLeLoc?a<=b:q.op==Op::BrLocEqLoc?a==b:a!=b;if(take)nextPc=static_cast<size_t>(q.aux);break;}
+                case Op::Jump:nextPc=static_cast<size_t>(q.imm);break;
+                default:return false;
+            }
+            if(nextPc<static_cast<size_t>(L.bodyBegin)||nextPc>static_cast<size_t>(L.bodyEnd))return false;
+            pc=nextPc;
+        }
+    }
+    return true;
+}
+
+static std::string periodicKey(const PeriodicLoop& L,const std::vector<int32_t>& loc){
+    std::string k;k.reserve(L.residueKeys.size()*4);
+    for(auto [slot,mod]:L.residueKeys){
+        int32_t r=loc[slot]%mod;
+        for(int b=0;b<4;++b)k.push_back(static_cast<char>((static_cast<uint32_t>(r)>>(8*b))&0xffu));
+    }
+    return k;
+}
+
 std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
     const IRProgram& program, std::uint64_t instructionBudget, std::uint64_t maxWallMillis) {
     Compiled cp;
@@ -915,6 +1233,119 @@ std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
                 else take=a!=b;
                 if(take) f.pc=static_cast<size_t>(x.aux); else f.pc += x.skip;
                 break;
+            }
+            case Op::FastPeriodicLoop: {
+                if(x.imm<0||x.imm>=static_cast<int>(fn.periodicLoops.size())) return std::nullopt;
+                const auto& L=fn.periodicLoops[x.imm];
+                if(L.iv<0||L.iv>=static_cast<int>(f.locals.size())) return std::nullopt;
+                if(L.boundSlot>=0&&L.boundSlot>=static_cast<int>(f.locals.size())) return std::nullopt;
+                const int32_t bound=L.boundSlot>=0?f.locals[L.boundSlot]:L.bound;
+                if(periodicExitTaken(L.exitOp,f.locals[L.iv],bound)){f.pc=static_cast<size_t>(L.exitPc);break;}
+                bool keysOK=true;for(auto [slot,mod]:L.residueKeys)if(slot<0||slot>=static_cast<int>(f.locals.size())||mod<=0){keysOK=false;break;}
+                if(!keysOK){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+
+                struct PeriodRec{uint64_t iter=0;std::vector<int32_t> loc;std::array<int32_t,REG_COUNT> regs{};};
+                std::unordered_map<std::string,size_t> seen;
+                seen.reserve(64);
+                std::vector<PeriodRec> recs;recs.reserve(64);
+                std::vector<int32_t> simLoc=f.locals;auto simRegs=f.r;
+                bool handled=false,found=false;size_t recIndex=0;uint64_t period=0;int64_t step=0;bool haveStep=false;
+                constexpr uint64_t MAX_PERIOD_SAMPLE=4096;
+                for(uint64_t iter=0;iter<=MAX_PERIOD_SAMPLE;++iter){
+                    const int32_t simBound=L.boundSlot>=0?simLoc[L.boundSlot]:L.bound;
+                    if(periodicExitTaken(L.exitOp,simLoc[L.iv],simBound)){
+                        f.locals=std::move(simLoc);f.r=simRegs;f.pc=static_cast<size_t>(L.exitPc);handled=true;break;
+                    }
+                    bool nonnegative=true;for(auto [slot,mod]:L.residueKeys)if(simLoc[slot]<0){nonnegative=false;break;}
+                    if(!nonnegative)break;
+                    std::string key=periodicKey(L,simLoc);
+                    auto hit=seen.find(key);
+                    if(hit!=seen.end()){
+                        recIndex=hit->second;period=iter-recs[recIndex].iter;
+                        if(period>0&&haveStep){found=true;break;}
+                    }else{
+                        seen.emplace(std::move(key),recs.size());
+                        recs.push_back({iter,simLoc,simRegs});
+                    }
+                    const int32_t before=simLoc[L.iv];
+                    if(!runPeriodicConcrete(fn,L,simLoc,simRegs))break;
+                    const int64_t d=static_cast<int64_t>(simLoc[L.iv])-static_cast<int64_t>(before);
+                    if(!haveStep){step=d;haveStep=true;}else if(d!=step){haveStep=false;break;}
+                    if(step==0){haveStep=false;break;}
+                }
+                if(handled)break;
+                if(!found||!haveStep||period==0){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+
+                const auto& startRec=recs[recIndex];
+                const int32_t cycleBound=L.boundSlot>=0?startRec.loc[L.boundSlot]:L.bound;
+                auto totalOpt=periodicTripCount(L.exitOp,startRec.loc[L.iv],cycleBound,step);
+                if(!totalOpt){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+                const uint64_t total=*totalOpt;
+                if(total<period){
+                    auto wl=startRec.loc;auto wr=startRec.regs;
+                    bool ok=true;for(uint64_t r=0;r<total;++r)if(!runPeriodicConcrete(fn,L,wl,wr)){ok=false;break;}
+                    if(ok){f.locals=std::move(wl);f.r=wr;f.pc=static_cast<size_t>(L.exitPc);break;}
+                    f.pc=static_cast<size_t>(L.bodyBegin);break;
+                }
+                const uint64_t cycles=total/period,residual=total%period;
+                std::vector<int32_t> work=startRec.loc;auto workRegs=startRec.regs;
+                std::unordered_set<int> modifiedSet(L.modified.begin(),L.modified.end());
+                std::vector<SymExpr> sloc(work.size());
+                for(size_t z=0;z<sloc.size();++z){
+                    if(static_cast<int>(z)==L.iv)sloc[z]=symX();
+                    else if(modifiedSet.count(static_cast<int>(z)))sloc[z]=symState(static_cast<int>(z));
+                    else sloc[z]=symConst(work[z]);
+                }
+                std::array<SymExpr,REG_COUNT> sr;for(auto& e:sr)e.ok=false;
+                auto symConcrete=work;auto symRegsConcrete=workRegs;
+                if(!runPeriodicSymbolic(fn,L,period,symConcrete,symRegsConcrete,sloc,sr)){
+                    f.pc=static_cast<size_t>(L.bodyBegin);break;
+                }
+                std::vector<SymExpr> next;next.reserve(L.modified.size());
+                for(int slot:L.modified){if(slot<0||slot>=static_cast<int>(sloc.size())){next.clear();break;}next.push_back(sloc[slot]);}
+                if(next.size()!=L.modified.size()){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+                // C signed remainder is only residue-periodic while the source
+                // stays nonnegative.  Prove that every branch-key source is
+                // invariant, the increasing induction variable, or a
+                // nondecreasing self recurrence over one complete period.
+                bool residueMonotone=true;
+                for(auto [kslot,kmod]:L.residueKeys){
+                    if(startRec.loc[kslot]<0){residueMonotone=false;break;}
+                    auto it=std::find(L.modified.begin(),L.modified.end(),static_cast<int16_t>(kslot));
+                    if(it==L.modified.end())continue;
+                    size_t mi=static_cast<size_t>(it-L.modified.begin());const SymExpr&e=next[mi];
+                    if(kslot==L.iv){if(step<=0){residueMonotone=false;break;}continue;}
+                    auto si=e.state.find(kslot);
+                    if(!e.ok||e.p[1]!=0||e.p[2]!=0||e.state.size()!=1||si==e.state.end()||si->second!=1||static_cast<int32_t>(e.p[0])<0){residueMonotone=false;break;}
+                }
+                if(!residueMonotone){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+
+                bool transformed=applyAffineTransition32(L.modified,next,L.iv,cycles,work);
+                if(!transformed){
+                    // Polynomial additive fallback: slot' = slot + P(iv), or a
+                    // pure overwrite by P(iv).  This covers periodic matrix
+                    // reductions whose per-period delta is quadratic at most.
+                    const int64_t x0=startRec.loc[L.iv];
+                    const int64_t cycleStep=step*static_cast<int64_t>(period);
+                    const int64_t lastX=x0+static_cast<int64_t>(cycles-1)*cycleStep;
+                    auto original=work; bool ok=true;
+                    for(size_t mi=0;mi<L.modified.size();++mi){
+                        int slot=L.modified[mi];const SymExpr&e=next[mi];if(!e.ok){ok=false;break;}
+                        if(slot==L.iv)continue;
+                        if(e.state.empty())work[slot]=static_cast<int32_t>(evalPoly(e.p,lastX));
+                        else if(e.state.size()==1&&e.state.count(slot)&&e.state.at(slot)==1)
+                            work[slot]=static_cast<int32_t>(static_cast<uint32_t>(original[slot])+sumPoly(e.p,x0,cycleStep,cycles));
+                        else {ok=false;break;}
+                    }
+                    if(ok)work[L.iv]=static_cast<int32_t>(static_cast<uint32_t>(x0)+static_cast<uint32_t>(static_cast<uint64_t>(static_cast<uint32_t>(cycleStep))*cycles));
+                    transformed=ok;
+                }
+                if(!transformed){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+                // A complete residue period returns to the same branch phase;
+                // execute only the small scalar tail concretely.
+                bool tailOK=true;for(uint64_t r=0;r<residual;++r)if(!runPeriodicConcrete(fn,L,work,workRegs)){tailOK=false;break;}
+                if(!tailOK){f.pc=static_cast<size_t>(L.bodyBegin);break;}
+                f.locals=std::move(work);f.r=workRegs;f.pc=static_cast<size_t>(L.exitPc);break;
             }
             case Op::FastLinearLoop: {
                 if(x.imm<0||x.imm>=static_cast<int>(fn.fastLoops.size())) return std::nullopt;
@@ -1060,3 +1491,4 @@ std::optional<std::int32_t> tryEvaluateIRAtCompileTime(
 }
 
 } // namespace toycc
+
