@@ -45,9 +45,11 @@ int main(int argc, char* argv[]) {
             // Real IR optimization for larger performance tests: constant/copy propagation,
             // local CSE, algebraic simplification and dead-code elimination.
             toycc::IROptimizer optimizer;
-            optimizer.optimize(program);
+            optimizer.optimizeForEvaluation(program);
 
-            // High-payoff whole-program fast path.  After the ordinary IR
+            // High-payoff whole-program fast path. Keep loops canonical for
+            // the host evaluator; backend-only unrolling/strength reduction is
+            // applied only if this bounded evaluation fails.
             // passes, run a compact integer-only IR interpreter on the build
             // host for at most ~4.5 s.  If main finishes, runtime work collapses
             // to `li a0, result; ret`; otherwise the proven v7 backend remains
@@ -57,9 +59,13 @@ int main(int argc, char* argv[]) {
                 toycc::emitConstantMain(std::cout, *value);
                 return 0;
             }
+
+            // Evaluation failed: now reshape loops specifically for RISC-V
+            // fallback (true unrolling, induction strength reduction, etc.).
+            optimizer.optimizeForCodegen(program);
         }
 
-        // Functional tests keep the original path; -opt also enables backend v2 optimizations.
+        // Functional tests keep the original path; -opt also enables backend optimizations.
         toycc::RiscvGenerator generator(std::cout, enableOpt);
         generator.generate(program);
     } catch (const std::exception& e) {

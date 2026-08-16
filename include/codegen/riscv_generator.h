@@ -38,6 +38,7 @@ private:
     bool tryEmitRegisterBinaryValue(const std::vector<IRInstr>& instrs, size_t& index);
     bool tryEmitPromotedOperandOp(const std::vector<IRInstr>& instrs, size_t& index);
     bool tryEmitMulAccumulateUpdate(const std::vector<IRInstr>& instrs, size_t& index);
+    bool tryEmitStoreForwarding(const std::vector<IRInstr>& instrs, size_t& index);
     bool emitSimpleValueToReg(const IRInstr& instr, const std::string& dest);
     std::string promotedRegForSlot(int logicalOffset) const;
     int physicalSlotOffset(int logicalOffset) const;

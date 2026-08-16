@@ -6,6 +6,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace toycc {
@@ -191,7 +192,9 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
     std::vector<int> loopWeight(func.instrs.size(), 1);
     for (size_t i = 0; i < func.instrs.size(); ++i) {
         const auto& ins = func.instrs[i];
-        if (ins.type != IRInstrType::JUMP) continue;
+        if (ins.type != IRInstrType::JUMP &&
+            ins.type != IRInstrType::BRANCH_ZERO &&
+            ins.type != IRInstrType::BRANCH_NONZERO) continue;
         auto it = labelIndex.find(ins.label);
         if (it == labelIndex.end() || it->second >= i) continue;
         for (size_t j = it->second; j <= i; ++j) loopWeight[j] += 32;
@@ -221,8 +224,45 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         return a.offset < b.offset;
     });
 
+    // Compute which logical slots carry a value across any CALL.  Caller-saved
+    // t2..t5 are safe for every other slot even in a non-leaf function: a call
+    // may clobber the register, but liveness proves the old slot value is dead
+    // and will be redefined before its next LOAD.
+    std::unordered_set<int> liveAcrossCall;
+    if (hasCall) {
+        const size_t n = func.instrs.size();
+        std::vector<std::vector<size_t>> succ(n);
+        for (size_t i=0;i<n;++i) {
+            const auto& ins=func.instrs[i];
+            if (ins.type==IRInstrType::RET) continue;
+            if (ins.type==IRInstrType::JUMP) {
+                auto it=labelIndex.find(ins.label); if(it!=labelIndex.end()) succ[i].push_back(it->second);
+            } else if (ins.type==IRInstrType::BRANCH_ZERO || ins.type==IRInstrType::BRANCH_NONZERO) {
+                auto it=labelIndex.find(ins.label); if(it!=labelIndex.end()) succ[i].push_back(it->second);
+                if(i+1<n) succ[i].push_back(i+1);
+            } else if (i+1<n) succ[i].push_back(i+1);
+        }
+        std::vector<std::unordered_set<int>> in(n), out(n);
+        bool changed=true; int rounds=0;
+        while(changed && rounds++<static_cast<int>(n)+8) {
+            changed=false;
+            for(size_t ii=n; ii-- > 0;) {
+                std::unordered_set<int> no;
+                for(size_t sidx:succ[ii]) no.insert(in[sidx].begin(),in[sidx].end());
+                std::unordered_set<int> ni=no;
+                const auto& ins=func.instrs[ii];
+                if(ins.type==IRInstrType::STORE) ni.erase(std::stoi(ins.src2));
+                if(ins.type==IRInstrType::LOAD) ni.insert(std::stoi(ins.src1));
+                if(no!=out[ii] || ni!=in[ii]) { out[ii]=std::move(no); in[ii]=std::move(ni); changed=true; }
+            }
+        }
+        for(size_t i=0;i<n;++i) if(func.instrs[i].type==IRInstrType::CALL)
+            liveAcrossCall.insert(out[i].begin(),out[i].end());
+    }
+
     std::vector<std::pair<int, std::string>> result;
-    result.reserve(16);
+    result.reserve(20);
+    std::unordered_set<int> assigned;
     size_t ci = 0;
 
     // In leaf functions t2..t5 are completely free: IRBuilder uses t0/t1 and
@@ -232,7 +272,9 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         static const char* leafRegs[] = {"t2", "t3", "t4", "t5"};
         for (const char* reg : leafRegs) {
             if (ci >= candidates.size()) break;
-            result.push_back({candidates[ci++].offset, reg});
+            result.push_back({candidates[ci].offset, reg});
+            assigned.insert(candidates[ci].offset);
+            ++ci;
         }
 
         // Unused argument registers are also free in a leaf function.  Only use
@@ -246,8 +288,28 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
             for (const auto& ins : func.instrs) {
                 if (ins.dest == reg || ins.src1 == reg || ins.src2 == reg) { mentioned = true; break; }
             }
-            if (!mentioned) result.push_back({candidates[ci++].offset, reg});
+            if (!mentioned) {
+                result.push_back({candidates[ci].offset, reg});
+                assigned.insert(candidates[ci].offset);
+                ++ci;
+            }
         }
+    } else {
+        // Non-leaf functions can still use t2..t5 for hot slots whose value is
+        // dead across every call.  These registers cost no prologue/epilogue
+        // traffic and often absorb call-local temporaries in graph/combined tests.
+        static const char* transientRegs[] = {"t2", "t3", "t4", "t5"};
+        for (const char* reg : transientRegs) {
+            const Candidate* pick=nullptr;
+            for (const auto& c : candidates) {
+                if (assigned.count(c.offset) || liveAcrossCall.count(c.offset)) continue;
+                pick=&c; break;
+            }
+            if (!pick) break;
+            result.push_back({pick->offset, reg});
+            assigned.insert(pick->offset);
+        }
+        ci = 0;
     }
 
     // s-register promotion costs one save + one restore per invocation.  It is
@@ -259,10 +321,12 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         "s6", "s7", "s8", "s9", "s10", "s11"
     };
     size_t si = 0;
-    for (; ci < candidates.size() && si < 12; ++ci) {
-        const auto& c = candidates[ci];
+    for (const auto& c : candidates) {
+        if (si >= 12) break;
+        if (assigned.count(c.offset)) continue;
         if (c.score < 66 && c.count < 6) continue;
         result.push_back({c.offset, savedRegs[si++]});
+        assigned.insert(c.offset);
     }
     return result;
 }

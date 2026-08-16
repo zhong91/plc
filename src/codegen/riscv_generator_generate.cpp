@@ -70,7 +70,10 @@ void RiscvGenerator::generate(const IRProgram& program) {
                 if (func.instrs[ii].type==IRInstrType::LABEL) labels[func.instrs[ii].label]=ii;
             std::vector<int> weight(func.instrs.size(),1);
             for (size_t ii=0; ii<func.instrs.size(); ++ii) {
-                const auto& ins=func.instrs[ii]; if(ins.type!=IRInstrType::JUMP) continue;
+                const auto& ins=func.instrs[ii];
+                if(ins.type!=IRInstrType::JUMP &&
+                   ins.type!=IRInstrType::BRANCH_ZERO &&
+                   ins.type!=IRInstrType::BRANCH_NONZERO) continue;
                 auto it=labels.find(ins.label); if(it==labels.end()||it->second>=ii) continue;
                 for(size_t j=it->second;j<=ii;++j) weight[j]+=32;
             }
@@ -171,6 +174,7 @@ void RiscvGenerator::generate(const IRProgram& program) {
             if (optimize && tryEmitImmediateBinaryValue(func.instrs, i)) continue;
             if (optimize && tryEmitRegisterBinaryValue(func.instrs, i)) continue;
             if (optimize && tryEmitPromotedOperandOp(func.instrs, i)) continue;
+            if (optimize && tryEmitStoreForwarding(func.instrs, i)) continue;
             if (optimize && tryEmitSpillPeephole(func.instrs, i)) continue;
             if (optimize && tryEmitSimplePair(func.instrs, i)) continue;
             if (optimize && func.instrs[i].type == IRInstrType::JUMP &&
