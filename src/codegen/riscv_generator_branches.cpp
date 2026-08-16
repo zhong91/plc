@@ -229,6 +229,34 @@ bool RiscvGenerator::tryEmitCompareBranch(const std::vector<IRInstr>& v, size_t&
 
 // if (x) / while (x) 这类条件直接在提升后的寄存器上分支。
 bool RiscvGenerator::tryEmitDirectValueBranch(const std::vector<IRInstr>& v, size_t& i) {
+    // LOAD hotSlot -> t0 ; SEQZ/SNEZ t0,t0 ; BRANCH t0
+    // can branch on the promoted slot directly. This is common after
+    // strength-reduced modulo counters and boolean normalization.
+    if (i + 2 < v.size()) {
+        const auto& val = v[i];
+        const auto& norm = v[i + 1];
+        const auto& br = v[i + 2];
+        if (val.type == IRInstrType::LOAD && val.dest == "t0" &&
+            (norm.type == IRInstrType::SEQZ || norm.type == IRInstrType::SNEZ) &&
+            norm.dest == "t0" && norm.src1 == "t0" &&
+            (br.type == IRInstrType::BRANCH_ZERO || br.type == IRInstrType::BRANCH_NONZERO) &&
+            br.src1 == "t0") {
+            std::string reg = promotedRegForSlot(std::stoi(val.src1));
+            if (!reg.empty()) {
+                // SEQZ: true iff x==0. SNEZ: true iff x!=0.
+                bool branchWhenZero = false;
+                if (norm.type == IRInstrType::SEQZ)
+                    branchWhenZero = (br.type == IRInstrType::BRANCH_NONZERO);
+                else
+                    branchWhenZero = (br.type == IRInstrType::BRANCH_ZERO);
+                emitLine(std::string("    ") + (branchWhenZero ? "beqz " : "bnez ") +
+                         reg + ", " + br.label);
+                i += 2;
+                return true;
+            }
+        }
+    }
+
     if (i + 1 >= v.size()) return false;
     const auto& val = v[i];
     const auto& br = v[i + 1];

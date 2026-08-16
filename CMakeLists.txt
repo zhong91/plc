@@ -17,6 +17,7 @@ add_library(toycc_frontend
     src/semantic/semantic_checker.cpp
     src/ir/ir_builder.cpp
     src/codegen/riscv_generator.cpp
+    src/codegen/riscv_generator_alloc.cpp
     src/codegen/riscv_generator_updates.cpp
     src/codegen/riscv_generator_branches.cpp
     src/codegen/riscv_generator_values.cpp
@@ -55,6 +56,7 @@ if(MSVC)
     # optimization.  This does not change the quality of generated RISC-V.
     set_source_files_properties(
         src/codegen/riscv_generator.cpp
+    src/codegen/riscv_generator_alloc.cpp
     src/codegen/riscv_generator_updates.cpp
     src/codegen/riscv_generator_branches.cpp
     src/codegen/riscv_generator_values.cpp

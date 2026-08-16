@@ -78,9 +78,68 @@ void RiscvGenerator::generate(const IRProgram& program) {
                 for(size_t j=it->second;j<=ii;++j) weight[j]+=32;
             }
             std::unordered_map<int,long long> cscore;
+            auto imm12 = [](long long x) { return x >= -2048 && x <= 2047; };
+            auto pow2Positive = [](long long x) {
+                if (x <= 0) return false;
+                const auto u = static_cast<unsigned long long>(x);
+                return (u & (u - 1ULL)) == 0;
+            };
+            auto liBenefitsFromRegister = [&](size_t ii, long long value) {
+                if (value == 0 || value == 1 || value == -1) return false;
+                if (ii + 2 >= func.instrs.size()) return false;
+                const auto& li = func.instrs[ii];
+                const auto& ld = func.instrs[ii + 1];
+                const auto& op = func.instrs[ii + 2];
+                if (li.dest != "t0" || ld.type != IRInstrType::LOAD || ld.dest != "t1" ||
+                    op.dest != "t0" || op.src1 != "t1" || op.src2 != "t0")
+                    return false;
+
+                // If the compare is immediately consumed by a branch, RISC-V has
+                // no register-vs-immediate branch, so retaining the bound in a
+                // register saves a repeated LI even for small constants.
+                bool feedsBranch = false;
+                if (op.type == IRInstrType::SLT) {
+                    if (ii + 3 < func.instrs.size() &&
+                        (func.instrs[ii + 3].type == IRInstrType::BRANCH_ZERO ||
+                         func.instrs[ii + 3].type == IRInstrType::BRANCH_NONZERO))
+                        feedsBranch = true;
+                    if (ii + 4 < func.instrs.size() &&
+                        func.instrs[ii + 3].type == IRInstrType::SEQZ &&
+                        (func.instrs[ii + 4].type == IRInstrType::BRANCH_ZERO ||
+                         func.instrs[ii + 4].type == IRInstrType::BRANCH_NONZERO))
+                        feedsBranch = true;
+                } else if (op.type == IRInstrType::SUB && ii + 4 < func.instrs.size() &&
+                           (func.instrs[ii + 3].type == IRInstrType::SEQZ ||
+                            func.instrs[ii + 3].type == IRInstrType::SNEZ) &&
+                           (func.instrs[ii + 4].type == IRInstrType::BRANCH_ZERO ||
+                            func.instrs[ii + 4].type == IRInstrType::BRANCH_NONZERO)) {
+                    feedsBranch = true;
+                }
+                if (feedsBranch) return true;
+
+                switch (op.type) {
+                    case IRInstrType::ADD:
+                        return !imm12(value);
+                    case IRInstrType::SUB:
+                        return !imm12(-value);
+                    case IRInstrType::MUL:
+                        return !pow2Positive(value);
+                    case IRInstrType::SLT:
+                        return !imm12(value);
+                    // Constant DIV/REM use the backend's magic-number sequence;
+                    // caching the source divisor does not remove those LIs.
+                    case IRInstrType::DIV:
+                    case IRInstrType::REM:
+                        return false;
+                    default:
+                        return false;
+                }
+            };
+
             for(size_t ii=0;ii<func.instrs.size();++ii) if(func.instrs[ii].type==IRInstrType::LI) {
                 long long v=std::stoll(func.instrs[ii].src1);
-                if(v>=std::numeric_limits<int>::min()&&v<=std::numeric_limits<int>::max()&&v!=0&&v!=1&&v!=-1) {
+                if(v>=std::numeric_limits<int>::min()&&v<=std::numeric_limits<int>::max() &&
+                   liBenefitsFromRegister(ii, v)) {
                     long long bonus = (v < -2048 || v > 2047) ? 4 : 1;
                     cscore[static_cast<int>(v)] += static_cast<long long>(weight[ii]) * bonus;
                 }

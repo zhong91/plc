@@ -1190,6 +1190,77 @@ bool eliminateDirectTailRecursion(IRFunction& func) {
 // The helper is already inlined, so routing every return through a0 is pure
 // overhead.  When all incoming returns are simple a0 definitions, write the
 // caller's destination slot on each return edge and remove the join copy.
+bool forwardInlineReturnsToT0(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 3) return false;
+
+    auto simpleA0Def = [](const IRInstr& ins) {
+        if (ins.dest != "a0") return false;
+        return ins.type == IRInstrType::LOAD || ins.type == IRInstrType::LI ||
+               ins.type == IRInstrType::MV || ins.type == IRInstrType::LOAD_GLOBAL ||
+               ins.type == IRInstrType::LOAD_ARG;
+    };
+    auto isTerminator = [](IRInstrType t) {
+        return t == IRInstrType::JUMP || t == IRInstrType::RET;
+    };
+
+    for (size_t l = 0; l + 1 < n; ++l) {
+        const auto& lab = func.instrs[l];
+        if (lab.type != IRInstrType::LABEL ||
+            lab.label.find(".ret_") == std::string::npos ||
+            lab.label.find(".inl") == std::string::npos)
+            continue;
+        if (func.instrs[l + 1].type != IRInstrType::MV ||
+            func.instrs[l + 1].dest != "t0" ||
+            func.instrs[l + 1].src1 != "a0")
+            continue;
+
+        const std::string retLabel = lab.label;
+        std::unordered_set<size_t> defs;
+        bool safe = true;
+
+        // Explicit incoming edges must be unconditional returns whose value is
+        // defined immediately before the jump. Branches to an inline return
+        // join are not rewritten because they need edge-specific copies.
+        for (size_t i = 0; i < n; ++i) {
+            const auto& ins = func.instrs[i];
+            if ((ins.type == IRInstrType::BRANCH_ZERO ||
+                 ins.type == IRInstrType::BRANCH_NONZERO) &&
+                ins.label == retLabel) {
+                safe = false; break;
+            }
+            if (ins.type == IRInstrType::JUMP && ins.label == retLabel) {
+                if (i == 0 || !simpleA0Def(func.instrs[i - 1])) {
+                    safe = false; break;
+                }
+                defs.insert(i - 1);
+            }
+        }
+        if (!safe) continue;
+
+        // Account for a real fallthrough predecessor. If the preceding
+        // instruction terminates control flow, there is no fallthrough edge.
+        if (l > 0 && !isTerminator(func.instrs[l - 1].type)) {
+            if (!simpleA0Def(func.instrs[l - 1])) continue;
+            defs.insert(l - 1);
+        }
+        if (defs.empty()) continue;
+
+        std::vector<IRInstr> out;
+        out.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (i == l + 1) continue; // remove MV t0,a0 at the join
+            IRInstr ins = func.instrs[i];
+            if (defs.count(i)) ins.dest = "t0";
+            out.push_back(std::move(ins));
+        }
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
+
 bool forwardInlineReturnsToDestination(IRFunction& func) {
     const size_t n = func.instrs.size();
     if (n < 4) return false;
@@ -1907,6 +1978,15 @@ void optimizeFunctionCommon(IRFunction& func) {
         changed |= removeRedundantSelfCopies(func);
         changed |= removeJumpToNextLabel(func);
         if (!changed) break;
+    }
+
+    // Only after destination-slot forwarding has had all optimizer rounds to
+    // consume inlined returns, remove the remaining a0->t0 convention for
+    // expression-valued inlines that have no immediate STORE destination.
+    for (int round = 0; round < 8; ++round) {
+        if (!forwardInlineReturnsToT0(func)) break;
+        removeRedundantSelfCopies(func);
+        removeJumpToNextLabel(func);
     }
 }
 

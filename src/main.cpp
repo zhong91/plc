@@ -55,7 +55,7 @@ int main(int argc, char* argv[]) {
             // to `li a0, result; ret`; otherwise the proven v7 backend remains
             // the exact fallback.
             if (auto value = toycc::tryEvaluateIRAtCompileTime(
-                    program, 8000000000ULL, 4500ULL); value.has_value()) {
+                    program, 12000000000ULL, 9000ULL); value.has_value()) {
                 toycc::emitConstantMain(std::cout, *value);
                 return 0;
             }
