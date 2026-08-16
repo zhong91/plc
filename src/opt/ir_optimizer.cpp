@@ -1717,7 +1717,10 @@ bool strengthReduceInductionRemainders(IRFunction& func) {
            s2.type!=IRInstrType::ADD||s2.dest!="t0"||s2.src1!="t1"||s2.src2!="t0"||
            s3.type!=IRInstrType::STORE||s3.src1!="t0"||!parseSlot(s3.src2,stiv)||stiv!=iv) continue;
         int ivStores=0;
-        for(size_t k=h+1;k<j;++k) if(func.instrs[k].type==IRInstrType::STORE){int q=-1;if(parseSlot(func.instrs[k].src2,q)&&q==iv)++ivStores;}
+        std::unordered_map<int,int> loopDefs;
+        for(size_t k=h+1;k<j;++k) if(func.instrs[k].type==IRInstrType::STORE){
+            int q=-1;if(parseSlot(func.instrs[k].src2,q)){++loopDefs[q];if(q==iv)++ivStores;}
+        }
         if(ivStores!=1) continue;
 
         // Recover a constant loop-entry value for iv from the straight-line preheader.
@@ -1729,29 +1732,109 @@ bool strengthReduceInductionRemainders(IRFunction& func) {
                 int q=-1;if(!parseSlot(func.instrs[k].src2,q)||q!=iv) continue;
                 if(k>0&&func.instrs[k-1].type==IRInstrType::LI&&func.instrs[k-1].dest=="t0") {
                     long long v=0;try{v=std::stoll(func.instrs[k-1].src1);}catch(...){break;}
-                    if(v>=0&&v<=std::numeric_limits<int32_t>::max()){ivInit=static_cast<int32_t>(v);haveInit=true;}
+                    if(v>=std::numeric_limits<int32_t>::min()&&v<=std::numeric_limits<int32_t>::max()){
+                        ivInit=static_cast<int32_t>(v);haveInit=true;
+                    }
                 }
                 break;
             }
         }
         if(!haveInit) continue;
 
-        struct Pat{size_t begin,end;int dest;int32_t mod,add;};
+        // Prove the common non-negative induction/invariant form.  Signed C
+        // remainder has a discontinuity while a negative dividend crosses a
+        // multiple of the divisor, so the cheap +1 cyclic recurrence is used
+        // only when the dividend is proven non-negative for the whole loop.
+        auto slotAlwaysNonnegative=[&](int slot)->bool{
+            int defs=0;
+            for(size_t q=0;q<func.instrs.size();++q){
+                const auto& st=func.instrs[q];
+                int dst=-1;
+                if(st.type!=IRInstrType::STORE||!parseSlot(st.src2,dst)||dst!=slot) continue;
+                ++defs; bool ok=false;
+                if(q>0&&func.instrs[q-1].type==IRInstrType::LI&&func.instrs[q-1].dest=="t0") {
+                    long long v=0;try{v=std::stoll(func.instrs[q-1].src1);}catch(...){return false;}
+                    ok=v>=0&&v<=std::numeric_limits<int32_t>::max();
+                }
+                if(!ok&&q>=3){
+                    const auto&a=func.instrs[q-3];const auto&b=func.instrs[q-2];const auto&o=func.instrs[q-1];
+                    int src=-1; long long inc=0;
+                    if(a.type==IRInstrType::LI&&a.dest=="t0"&&b.type==IRInstrType::LOAD&&b.dest=="t1"&&
+                       parseSlot(b.src1,src)&&src==slot&&o.type==IRInstrType::ADD&&o.dest=="t0"&&o.src1=="t1"&&o.src2=="t0") {
+                        try{inc=std::stoll(a.src1);}catch(...){return false;}
+                        ok=inc>=0&&inc<=std::numeric_limits<int32_t>::max();
+                    }
+                }
+                if(!ok) return false;
+            }
+            return defs>0;
+        };
+
+        // Describe a value that advances by exactly +1 whenever iv advances by
+        // +1.  Besides iv itself, accept `iv + invariantLocal` and `iv + C`.
+        // This is especially common in nested graph/matrix loops such as
+        // `(outer + inner) % 7`.  The invariant may change between invocations
+        // of the inner loop; the cyclic remainder is therefore initialized at
+        // the loop preheader, not at compile time.
+        struct SourceDesc { int invariantSlot=-1; int32_t offsetImm=0; };
+        auto affineSource=[&](int srcSlot,size_t before,SourceDesc& desc)->bool{
+            if(srcSlot==iv){if(ivInit<0)return false;desc={-1,0};return true;}
+            // Require exactly one definition of the temporary in this loop.
+            if(loopDefs[srcSlot]!=1) return false;
+            // Find its defining four-instruction ADD before the REM use.
+            for(size_t stPos=before; stPos-- > h+3;) {
+                const auto& st=func.instrs[stPos];
+                int dst=-1;
+                if(st.type!=IRInstrType::STORE||st.src1!="t0"||!parseSlot(st.src2,dst)||dst!=srcSlot) continue;
+                if(stPos<3) return false;
+                const auto& x0=func.instrs[stPos-3];
+                const auto& x1=func.instrs[stPos-2];
+                const auto& op=func.instrs[stPos-1];
+                if(op.type!=IRInstrType::ADD||op.dest!="t0"||op.src1!="t1"||op.src2!="t0") return false;
+                int slot0=-1,slot1=-1; bool load0=x0.type==IRInstrType::LOAD&&x0.dest=="t0"&&parseSlot(x0.src1,slot0);
+                bool load1=x1.type==IRInstrType::LOAD&&x1.dest=="t1"&&parseSlot(x1.src1,slot1);
+                bool imm0=x0.type==IRInstrType::LI&&x0.dest=="t0";
+                // LOAD rhs -> t0 ; LOAD lhs -> t1 ; ADD
+                if(load0&&load1){
+                    int inv=-1;
+                    if(slot0==iv&&slot1!=iv) inv=slot1;
+                    else if(slot1==iv&&slot0!=iv) inv=slot0;
+                    if(inv<0||loopDefs.count(inv)||ivInit<0||!slotAlwaysNonnegative(inv)) return false;
+                    desc={inv,0}; return true;
+                }
+                // LI constant -> t0 ; LOAD iv -> t1 ; ADD
+                if(imm0&&load1&&slot1==iv){
+                    long long z=0;try{z=std::stoll(x0.src1);}catch(...){return false;}
+                    if(z<std::numeric_limits<int32_t>::min()||z>std::numeric_limits<int32_t>::max()) return false;
+                    const int64_t base=static_cast<int64_t>(ivInit)+z;
+                    if(ivInit<0||base<0||base>std::numeric_limits<int32_t>::max()) return false;
+                    desc={-1,static_cast<int32_t>(z)}; return true;
+                }
+                return false;
+            }
+            return false;
+        };
+
+        struct Pat{size_t begin,end;int dest;int32_t mod,add;SourceDesc src;};
         std::vector<Pat> pats;
         for(size_t k=h+1;k+3<stepStart;) {
-            const auto&a=func.instrs[k];const auto&b=func.instrs[k+1];const auto&r=func.instrs[k+2];const auto&st=func.instrs[k+3];
-            int qiv=-1,dst=-1;
-            if(a.type==IRInstrType::LI&&a.dest=="t0"&&b.type==IRInstrType::LOAD&&b.dest=="t1"&&parseSlot(b.src1,qiv)&&qiv==iv&&
+            const auto&a=func.instrs[k];const auto&b=func.instrs[k+1];
+            const auto&r=func.instrs[k+2];const auto&st=func.instrs[k+3];
+            int qsrc=-1,dst=-1;
+            if(a.type==IRInstrType::LI&&a.dest=="t0"&&b.type==IRInstrType::LOAD&&b.dest=="t1"&&parseSlot(b.src1,qsrc)&&
                r.type==IRInstrType::REM&&r.dest=="t0"&&r.src1=="t1"&&r.src2=="t0"&&
                st.type==IRInstrType::STORE&&st.src1=="t0"&&parseSlot(st.src2,dst)) {
                 long long m=0;try{m=std::stoll(a.src1);}catch(...){++k;continue;}
                 if(m<=1||m>1000000){++k;continue;}
+                SourceDesc src;
+                if(!affineSource(qsrc,k,src)){++k;continue;}
                 int32_t add=0; size_t end=k+4; int finalDst=dst;
                 // Optional immediately-following + K.
                 if(k+7<stepStart) {
-                    const auto&c0=func.instrs[k+4];const auto&c1=func.instrs[k+5];const auto&c2=func.instrs[k+6];const auto&c3=func.instrs[k+7];
-                    int src=-1,fd=-1;
-                    if(c0.type==IRInstrType::LI&&c0.dest=="t0"&&c1.type==IRInstrType::LOAD&&c1.dest=="t1"&&parseSlot(c1.src1,src)&&src==dst&&
+                    const auto&c0=func.instrs[k+4];const auto&c1=func.instrs[k+5];
+                    const auto&c2=func.instrs[k+6];const auto&c3=func.instrs[k+7];
+                    int srcSlot=-1,fd=-1;
+                    if(c0.type==IRInstrType::LI&&c0.dest=="t0"&&c1.type==IRInstrType::LOAD&&c1.dest=="t1"&&parseSlot(c1.src1,srcSlot)&&srcSlot==dst&&
                        c2.type==IRInstrType::ADD&&c2.dest=="t0"&&c2.src1=="t1"&&c2.src2=="t0"&&
                        c3.type==IRInstrType::STORE&&c3.src1=="t0"&&parseSlot(c3.src2,fd)) {
                         long long z=0;try{z=std::stoll(c0.src1);}catch(...){z=0;}
@@ -1760,32 +1843,59 @@ bool strengthReduceInductionRemainders(IRFunction& func) {
                         }
                     }
                 }
-                const int64_t lo=add, hi=static_cast<int64_t>(add)+m-1;
+                const int64_t lo=static_cast<int64_t>(add)-(m-1); // signed REM may start negative
+                const int64_t hi=static_cast<int64_t>(add)+m-1;
                 if(lo<std::numeric_limits<int32_t>::min()||hi>std::numeric_limits<int32_t>::max()){++k;continue;}
-                pats.push_back({k,end,finalDst,static_cast<int32_t>(m),add}); k=end; continue;
+                pats.push_back({k,end,finalDst,static_cast<int32_t>(m),add,src}); k=end; continue;
             }
             ++k;
         }
         if(pats.empty()) continue;
 
-        struct Cyc{int32_t mod,add;int slot;std::string wrap;};
+        struct Cyc{int32_t mod,add;SourceDesc src;int slot;std::string wrap;};
         std::vector<Cyc> cycles;
-        auto cycFor=[&](int32_t mod,int32_t add)->int{
-            for(size_t z=0;z<cycles.size();++z) if(cycles[z].mod==mod&&cycles[z].add==add)return static_cast<int>(z);
+        auto sameSrc=[](const SourceDesc&a,const SourceDesc&b){return a.invariantSlot==b.invariantSlot&&a.offsetImm==b.offsetImm;};
+        auto cycFor=[&](int32_t mod,int32_t add,const SourceDesc&src)->int{
+            for(size_t z=0;z<cycles.size();++z)
+                if(cycles[z].mod==mod&&cycles[z].add==add&&sameSrc(cycles[z].src,src))return static_cast<int>(z);
             int slot=func.localSize;func.localSize+=4;
-            cycles.push_back({mod,add,slot,".remcycle_"+func.name+"_"+std::to_string(h)+"_"+std::to_string(cycles.size())});
+            cycles.push_back({mod,add,src,slot,".remcycle_"+func.name+"_"+std::to_string(h)+"_"+std::to_string(cycles.size())});
             return static_cast<int>(cycles.size()-1);
         };
         std::unordered_map<size_t,int> at;
-        for(size_t z=0;z<pats.size();++z) at[pats[z].begin]=cycFor(pats[z].mod,pats[z].add);
+        for(const auto& p0:pats) at[p0.begin]=cycFor(p0.mod,p0.add,p0.src);
 
-        std::vector<IRInstr> out;out.reserve(func.instrs.size()+cycles.size()*14);
+        std::vector<IRInstr> out;out.reserve(func.instrs.size()+cycles.size()*18);
         for(size_t k=0;k<func.instrs.size();) {
             if(k==h) {
                 for(const auto&c:cycles) {
-                    const int32_t init=static_cast<int32_t>(static_cast<int64_t>(ivInit%c.mod)+c.add);
-                    out.emplace_back(IRInstrType::LI,"t0",std::to_string(init));
-                    out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(c.slot));
+                    if(c.src.invariantSlot<0) {
+                        const int64_t base=static_cast<int64_t>(ivInit)+c.src.offsetImm;
+                        if(base<std::numeric_limits<int32_t>::min()||base>std::numeric_limits<int32_t>::max()) return false;
+                        const int32_t init=static_cast<int32_t>(base%c.mod+c.add);
+                        out.emplace_back(IRInstrType::LI,"t0",std::to_string(init));
+                        out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(c.slot));
+                    } else {
+                        // Compute signed `(invariant + ivInit + offset) % mod + add`
+                        // once per loop invocation.  The back edge targets the
+                        // LABEL below and therefore skips this preheader.
+                        out.emplace_back(IRInstrType::LOAD,"t0",std::to_string(c.src.invariantSlot));
+                        const int64_t add0=static_cast<int64_t>(ivInit)+c.src.offsetImm;
+                        if(add0!=0) {
+                            if(add0<std::numeric_limits<int32_t>::min()||add0>std::numeric_limits<int32_t>::max()) return false;
+                            out.emplace_back(IRInstrType::LI,"t1",std::to_string(static_cast<int32_t>(add0)));
+                            out.emplace_back(IRInstrType::ADD,"t0","t0","t1");
+                        }
+                        out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(c.slot));
+                        out.emplace_back(IRInstrType::LI,"t0",std::to_string(c.mod));
+                        out.emplace_back(IRInstrType::LOAD,"t1",std::to_string(c.slot));
+                        out.emplace_back(IRInstrType::REM,"t0","t1","t0");
+                        if(c.add!=0) {
+                            out.emplace_back(IRInstrType::LI,"t1",std::to_string(c.add));
+                            out.emplace_back(IRInstrType::ADD,"t0","t0","t1");
+                        }
+                        out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(c.slot));
+                    }
                 }
             }
             if(k==stepStart) {
@@ -1806,8 +1916,7 @@ bool strengthReduceInductionRemainders(IRFunction& func) {
             }
             auto ai=at.find(k);
             if(ai!=at.end()) {
-                const Pat* pp=nullptr;
-                for(const auto&x:pats)if(x.begin==k){pp=&x;break;}
+                const Pat* pp=nullptr;for(const auto&x:pats)if(x.begin==k){pp=&x;break;}
                 const auto&c=cycles[ai->second];
                 out.emplace_back(IRInstrType::LOAD,"t0",std::to_string(c.slot));
                 out.emplace_back(IRInstrType::STORE,"","t0",std::to_string(pp->dest));
@@ -1890,17 +1999,20 @@ bool unrollSimpleLoops(IRFunction& func) {
             }
         }
         if(updates!=1||step<=0) continue;
-        const long long fastBound=bound-3*step;
-        if(fastBound<std::numeric_limits<int32_t>::min()||fastBound>std::numeric_limits<int32_t>::max()) continue;
-
         const size_t bodyBegin=branchPos+1, bodyEnd=j;
         const size_t bodyLen=bodyEnd-bodyBegin;
         if(bodyLen==0||bodyLen>32) continue;
+        // Tiny hot loops benefit from a wider unroll because branch overhead is
+        // a large fraction of their dynamic work.  Keep 4x for medium bodies to
+        // avoid excessive code growth/instruction-cache pressure.
+        const int unrollFactor = bodyLen <= 12 ? 8 : 4;
+        const long long fastBound=bound-static_cast<long long>(unrollFactor-1)*step;
+        if(fastBound<std::numeric_limits<int32_t>::min()||fastBound>std::numeric_limits<int32_t>::max()) continue;
 
-        const std::string fastLabel=header+".u4."+std::to_string(serial);
+        const std::string fastLabel=header+".u"+std::to_string(unrollFactor)+"."+std::to_string(serial);
         const std::string tailLabel=header+".tail."+std::to_string(serial++);
         std::vector<IRInstr> out;
-        out.reserve(func.instrs.size()+bodyLen*4+8);
+        out.reserve(func.instrs.size()+bodyLen*static_cast<size_t>(unrollFactor)+8);
         out.insert(out.end(),func.instrs.begin(),func.instrs.begin()+static_cast<long>(h));
         // One entry guard, then a bottom-tested 4-at-a-time loop.  The steady
         // state therefore executes one branch per four source iterations rather
@@ -1910,7 +2022,7 @@ bool unrollSimpleLoops(IRFunction& func) {
         out.emplace_back(IRInstrType::SLT,"t0","t1","t0");
         out.emplace_back(IRInstrType::BRANCH_ZERO,"","t0","",tailLabel);
         out.emplace_back(IRInstrType::LABEL,"","","",fastLabel);
-        for(int copy=0;copy<4;++copy)
+        for(int copy=0;copy<unrollFactor;++copy)
             out.insert(out.end(),func.instrs.begin()+static_cast<long>(bodyBegin),func.instrs.begin()+static_cast<long>(bodyEnd));
         out.emplace_back(IRInstrType::LI,"t0",std::to_string(fastBound));
         out.emplace_back(IRInstrType::LOAD,"t1",std::to_string(iv));
@@ -1991,9 +2103,16 @@ void optimizeFunctionCommon(IRFunction& func) {
 }
 
 void optimizeFunctionForCodegen(IRFunction& func) {
-    bool strengthChanged = strengthReduceInductionProducts(func);
-    strengthChanged |= strengthReduceInductionRemainders(func);
-    if (strengthChanged) {
+    // The individual strength-reduction helpers intentionally rewrite one
+    // natural loop at a time and then return so all CFG indices can be rebuilt.
+    // Run them to a bounded fixed point; otherwise a matrix/graph function with
+    // several (or nested) loops would optimize only the first matching loop.
+    for (int srRound = 0; srRound < 12; ++srRound) {
+        bool strengthChanged = false;
+        strengthChanged |= strengthReduceInductionProducts(func);
+        strengthChanged |= strengthReduceInductionRemainders(func);
+        if (!strengthChanged) break;
+
         for (int round=0; round<3; ++round) {
             bool changed=false;
             changed |= propagateConstantsAcrossCFG(func);
@@ -2008,7 +2127,11 @@ void optimizeFunctionForCodegen(IRFunction& func) {
             if(!changed) break;
         }
     }
+
     hoistSimpleLoopInvariants(func);
+    // Keep unrolling single-shot.  The transform deliberately leaves the
+    // original scalar loop as a remainder path, so repeatedly invoking the
+    // matcher could select that tail again and duplicate it.
     unrollSimpleLoops(func);
 }
 
@@ -2040,7 +2163,7 @@ bool inlineSmallLeafFunctions(IRProgram& program) {
     // cheaper than millions of ABI/prologue/epilogue sequences at runtime.
     std::unordered_map<std::string, const IRFunction*> candidates;
     for (const auto& f : program.functions)
-        if (isLeafInlineCandidate(f, 96, 384)) candidates[f.name] = &f;
+        if (isLeafInlineCandidate(f, 160, 640)) candidates[f.name] = &f;
     if (candidates.empty()) return false;
 
     bool any=false;
@@ -2059,6 +2182,13 @@ bool inlineSmallLeafFunctions(IRProgram& program) {
             const bool ordinarySmall = callee.instrs.size()<=48 && callee.localSize<=192;
             const bool hotSite = callPos<hot.size() && hot[callPos];
             if (!ordinarySmall && !hotSite) { out.push_back(ins); continue; }
+            // Keep inlining profitable and bounded.  Hot loop helpers may be
+            // moderately larger than ordinary leaf calls, but never allow a
+            // repeated bottom-up round to explode one caller indefinitely.
+            if (caller.instrs.size() + callee.instrs.size() > 1400 ||
+                caller.localSize + callee.localSize > 4096) {
+                out.push_back(ins); continue;
+            }
             const int base=caller.localSize;
             caller.localSize += callee.localSize;
             const std::string suffix=".inl"+std::to_string(serial++);
@@ -2109,7 +2239,15 @@ bool propagateImmutableGlobals(IRProgram& program) {
 void IROptimizer::optimizeForEvaluation(IRProgram& program) const {
     propagateImmutableGlobals(program);
     for (auto& func : program.functions) optimizeFunctionCommon(func);
-    inlineSmallLeafFunctions(program);
+
+    // Inline bottom-up to a small fixed point.  A caller that originally was
+    // not a leaf can become a leaf after its own callees are inlined; rebuilding
+    // the candidate set lets that newly simplified helper disappear at its hot
+    // callers as well.  The existing per-function/site size limits still cap
+    // code growth, and recursion is never selected as an inline candidate.
+    for (int round = 0; round < 6; ++round) {
+        if (!inlineSmallLeafFunctions(program)) break;
+    }
 }
 
 void IROptimizer::optimizeForCodegen(IRProgram& program) const {

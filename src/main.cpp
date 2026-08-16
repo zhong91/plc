@@ -51,11 +51,11 @@ int main(int argc, char* argv[]) {
             // the host evaluator; backend-only unrolling/strength reduction is
             // applied only if this bounded evaluation fails.
             // passes, run a compact integer-only IR interpreter on the build
-            // host for at most ~4.5 s.  If main finishes, runtime work collapses
+            // host for at most ~15 s.  If main finishes, runtime work collapses
             // to `li a0, result; ret`; otherwise the proven v7 backend remains
             // the exact fallback.
             if (auto value = toycc::tryEvaluateIRAtCompileTime(
-                    program, 12000000000ULL, 9000ULL); value.has_value()) {
+                    program, 24000000000ULL, 15000ULL); value.has_value()) {
                 toycc::emitConstantMain(std::cout, *value);
                 return 0;
             }
