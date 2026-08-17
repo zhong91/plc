@@ -82,6 +82,21 @@ bool RiscvGenerator::tryEmitStoreForwarding(const std::vector<IRInstr>& v, size_
                             default: break;
                         }
                     }
+                    if(rhs.type==IRInstrType::LOAD&&rhs.dest=="t0"&&rhs.src1==st.src2) {
+                        // The RHS is the exact value whose spill store is being
+                        // elided.  Re-loading that logical slot would read stale
+                        // memory; both operands are already the value in t0.
+                        switch(op.type) {
+                            case IRInstrType::ADD: emitLine("    slli "+dst+", t0, 1"); break;
+                            case IRInstrType::SUB: emitLine("    li "+dst+", 0"); break;
+                            case IRInstrType::MUL: emitLine("    mul "+dst+", t0, t0"); break;
+                            case IRInstrType::DIV: emitLine("    li "+dst+", 1"); break;
+                            case IRInstrType::REM:
+                            case IRInstrType::SLT: emitLine("    li "+dst+", 0"); break;
+                            default: break;
+                        }
+                        i+=4;return true;
+                    }
                     if(rhs.type==IRInstrType::LOAD&&rhs.dest=="t0") {
                         std::string rr=promotedRegForSlot(std::stoi(rhs.src1));
                         if(rr.empty()) {emitLoadFromSp("t1",physicalSlotOffset(std::stoi(rhs.src1)));rr="t1";}

@@ -58,8 +58,41 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         }
     }
 
+    // A logical slot whose value is read before its first write on a natural
+    // loop path is loop-carried state, not a disposable expression spill.  The
+    // old per-slot spill heuristic could see one eliminable STORE/LOAD pair in
+    // an unrolled induction update and then exclude the *entire* induction
+    // variable from register promotion, leaving an lw/sw in every hot trip.
+    std::unordered_set<int> loopCarriedSlots;
+    for (size_t back = 0; back < n; ++back) {
+        const auto& edge = func.instrs[back];
+        if (edge.type != IRInstrType::JUMP &&
+            edge.type != IRInstrType::BRANCH_ZERO &&
+            edge.type != IRInstrType::BRANCH_NONZERO)
+            continue;
+        auto hit = labelIndex.find(edge.label);
+        if (hit == labelIndex.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+        std::unordered_set<int> seenAccess;
+        for (size_t k = h; k <= back; ++k) {
+            const auto& in = func.instrs[k];
+            int slot = -1;
+            bool isLoad = false;
+            if (in.type == IRInstrType::LOAD) {
+                slot = std::stoi(in.src1); isLoad = true;
+            } else if (in.type == IRInstrType::STORE) {
+                slot = std::stoi(in.src2);
+            } else {
+                continue;
+            }
+            if (!seenAccess.insert(slot).second) continue;
+            if (isLoad) loopCarriedSlots.insert(slot);
+        }
+    }
+
     // Spill temporaries that are guaranteed to disappear in a later peephole
-    // should not consume scarce promoted registers.
+    // should not consume scarce promoted registers.  Never classify proven
+    // loop-carried state as such a temporary.
     std::unordered_map<int, bool> eliminatedSpills;
     for (size_t i = 0; i + 3 < n; ++i) {
         const auto& st = func.instrs[i];
@@ -74,8 +107,10 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         const bool simpleRhs = rhs.dest == "t0" &&
             (rhs.type == IRInstrType::LI || rhs.type == IRInstrType::LOAD ||
              rhs.type == IRInstrType::LOAD_ARG || rhs.type == IRInstrType::LOAD_GLOBAL);
-        if (simpleRhs && !hasAdditionalLoadOfSlotAlloc(func.instrs, st.src2, i + 2)) {
-            eliminatedSpills[std::stoi(st.src2)] = true;
+        const int spillSlot = std::stoi(st.src2);
+        if (simpleRhs && !loopCarriedSlots.count(spillSlot) &&
+            !hasAdditionalLoadOfSlotAlloc(func.instrs, st.src2, i + 2)) {
+            eliminatedSpills[spillSlot] = true;
         }
     }
 

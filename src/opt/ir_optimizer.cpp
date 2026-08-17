@@ -2462,9 +2462,32 @@ bool summarizeLinearStateCountedLoop(IRFunction& func) {
         for (size_t i = 0; i < state.size(); ++i) pos[state[i]] = i;
         const size_t D = state.size() + 1;
 
+        // Only state values that are actually read by the one-iteration
+        // transition need an entry value.  Scalar DCE is allowed to remove an
+        // initializer for a slot that is overwritten before its first read in
+        // the loop (a common shape in copy/CSE/algebra benchmarks).  Requiring
+        // such a dead initializer here would make this recurrence pass reject
+        // an otherwise fully-proven transition merely because an earlier pass
+        // correctly deleted dead code.
+        std::unordered_set<int> entryValueNeeded;
+        for (int q : state) {
+            AffineLoopExpr e = slots.count(q) ? slots[q] : affineIdentity(q);
+            if (!e.valid) { depsOK = false; break; }
+            for (const auto& [dep, coeff] : e.coeff)
+                if (coeff != 0) entryValueNeeded.insert(dep);
+        }
+        if (!depsOK) continue;
+
         std::vector<std::uint32_t> initVec(D, 0);
         bool initOK = true;
         for (size_t i = 0; i < state.size(); ++i) {
+            if (!entryValueNeeded.count(state[i])) {
+                // The first transition overwrites this state before any old
+                // value can contribute, so its mathematical entry value is a
+                // don't-care.  Zero is a convenient neutral placeholder.
+                initVec[i] = 0;
+                continue;
+            }
             auto c = straightLineConstBefore(func, h, state[i]);
             if (!c) { initOK = false; break; }
             initVec[i] = static_cast<std::uint32_t>(*c);
@@ -4227,6 +4250,7 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
         //   LI 1; LOAD countdown; SUB; STORE condSlot
         // The ADD -1 spelling is accepted too.
         bool unitDecrement = false;
+        size_t decrementPos = n;
         for (size_t k = bodyBegin; k + 3 < bodyEnd; ++k) {
             const auto& i0 = func.instrs[k];
             const auto& i1 = func.instrs[k + 1];
@@ -4244,15 +4268,15 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
             try { imm = std::stoll(i0.src1); } catch (...) { continue; }
             if (i2.type == IRInstrType::SUB && imm == 1 &&
                 i2.src1 == i1.dest && i2.src2 == i0.dest) {
-                unitDecrement = true; break;
+                unitDecrement = true; decrementPos = k; break;
             }
             if (i2.type == IRInstrType::ADD && imm == -1 &&
                 ((i2.src1 == i1.dest && i2.src2 == i0.dest) ||
                  (i2.src2 == i1.dest && i2.src1 == i0.dest))) {
-                unitDecrement = true; break;
+                unitDecrement = true; decrementPos = k; break;
             }
         }
-        if (!unitDecrement) continue;
+        if (!unitDecrement || decrementPos == n) continue;
 
         // The condition temporary and the carried countdown must each have the
         // unique stores proven above; otherwise a duplicated 16-trip body could
@@ -4274,6 +4298,47 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
         constexpr int F = 16;
         if (!init || *init < F) continue;
 
+        // The tail-call argument builder computes the new countdown into a
+        // temporary before computing the other new arguments, then copies that
+        // temporary back to the carried countdown slot.  Other arguments often
+        // still need the *old* countdown (factorial-style `acc*n` is the common
+        // case), which makes the temporary overlap the old countdown and forces
+        // an otherwise useless register-to-register move every source trip.
+        //
+        // Retiming the proven pure `countdown-1` producer to immediately before
+        // its unique copy-back is dependency-safe: countdownSlot has no other
+        // store in the body, condSlot has one store and its only body load is the
+        // copy-back.  This is ordinary local instruction scheduling / copy
+        // coalescing; no source iteration is executed at compile time.
+        int condLoadsInBody = 0;
+        for (size_t k = bodyBegin; k < bodyEnd; ++k) {
+            if (func.instrs[k].type != IRInstrType::LOAD) continue;
+            int q = -1;
+            if (parseSlot(func.instrs[k].src1, q) && q == condSlot)
+                ++condLoadsInBody;
+        }
+        const bool canRetimeCountdown =
+            decrementPos + 3 < countdownCopy && condLoadsInBody == 1;
+
+        std::vector<IRInstr> scheduledBody;
+        scheduledBody.reserve(bodyEnd - bodyBegin);
+        if (canRetimeCountdown) {
+            for (size_t k = bodyBegin; k < bodyEnd;) {
+                if (k == decrementPos) { k += 4; continue; }
+                if (k == countdownCopy) {
+                    scheduledBody.insert(scheduledBody.end(),
+                        func.instrs.begin() + static_cast<long>(decrementPos),
+                        func.instrs.begin() + static_cast<long>(decrementPos + 4));
+                }
+                scheduledBody.push_back(func.instrs[k]);
+                ++k;
+            }
+        } else {
+            scheduledBody.insert(scheduledBody.end(),
+                func.instrs.begin() + static_cast<long>(bodyBegin),
+                func.instrs.begin() + static_cast<long>(bodyEnd));
+        }
+
         const std::string fastGuard = ".tail_inl_u16_guard_" + func.name + "_" +
                                       std::to_string(serial);
         const std::string fastBody = ".tail_inl_u16_body_" + func.name + "_" +
@@ -4284,7 +4349,7 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
                                  std::to_string(serial++);
 
         std::vector<IRInstr> out;
-        out.reserve(n + (bodyEnd - bodyBegin) * (F - 1) + 16);
+        out.reserve(n + scheduledBody.size() * (F - 1) + 16);
         out.insert(out.end(), func.instrs.begin(),
                    func.instrs.begin() + static_cast<long>(h));
 
@@ -4296,15 +4361,17 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
         out.emplace_back(IRInstrType::LABEL, "", "", "", fastBody);
 
         for (int copy = 0; copy < F; ++copy)
-            out.insert(out.end(),
-                       func.instrs.begin() + static_cast<long>(bodyBegin),
-                       func.instrs.begin() + static_cast<long>(bodyEnd));
+            out.insert(out.end(), scheduledBody.begin(), scheduledBody.end());
         out.emplace_back(IRInstrType::JUMP, "", "", "", fastGuard);
 
         out.emplace_back(IRInstrType::LABEL, "", "", "", tail);
         out.emplace_back(IRInstrType::LOAD, "t0", std::to_string(countdownSlot));
         out.emplace_back(IRInstrType::BRANCH_ZERO, "", "t0", "", done);
-        out.insert(out.end(), func.instrs.begin() + static_cast<long>(h),
+        // Exact scalar remainder, using the same dependency-safe scheduled
+        // body so register allocation sees one consistent live-range shape.
+        out.push_back(func.instrs[h]);
+        out.insert(out.end(), scheduledBody.begin(), scheduledBody.end());
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(bodyEnd),
                    func.instrs.begin() + static_cast<long>(back + 1));
         out.emplace_back(IRInstrType::LABEL, "", "", "", done);
         out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),

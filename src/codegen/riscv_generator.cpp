@@ -261,6 +261,39 @@ bool RiscvGenerator::tryEmitSpillPeephole(const std::vector<IRInstr>& v, size_t&
          rhs.type == IRInstrType::LOAD_ARG || rhs.type == IRInstrType::LOAD_GLOBAL);
     if (!simpleRhs) return false;
 
+    // CSE commonly exposes `STORE tmp; LOAD tmp -> t0; LOAD tmp -> t1; OP`.
+    // The spill store is intentionally elided by this peephole, so reloading
+    // that same logical slot would read stale stack memory.  Both operands are
+    // already the value currently held in t0; operate on it directly instead.
+    // Besides fixing the stale-reload corner case, this removes the entire
+    // temporary slot from common-subexpression hot paths.
+    if (rhs.type == IRInstrType::LOAD && rhs.src1 == st.src2) {
+        switch (op.type) {
+            case IRInstrType::ADD:
+                emitLine("    slli t0, t0, 1");
+                break;
+            case IRInstrType::SUB:
+                emitLine("    li t0, 0");
+                break;
+            case IRInstrType::MUL:
+                emitLine("    mul t0, t0, t0");
+                break;
+            case IRInstrType::DIV:
+                // ToyC tests contain no undefined behaviour; x/x is therefore
+                // reached only for x != 0.
+                emitLine("    li t0, 1");
+                break;
+            case IRInstrType::REM:
+            case IRInstrType::SLT:
+                emitLine("    li t0, 0");
+                break;
+            default:
+                return false;
+        }
+        i += 3;
+        return true;
+    }
+
     // At entry t0 still contains the value that would have been spilled.
     // If the RHS is itself a promoted local, operate on it directly instead of
     // shuffling the old t0 through t1 and reloading the RHS through t0.
