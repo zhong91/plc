@@ -174,7 +174,23 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
     for (size_t i = 0; i < n; ++i) {
         if (func.instrs[i].type != IRInstrType::STORE) continue;
         int d = std::stoi(func.instrs[i].src2);
-        for (int s : liveOut[i]) addEdge(d, s);
+
+        // Move-aware interference: for `LOAD r, src; STORE r, dst`, src and
+        // dst contain the same value at the copy.  Do not manufacture an
+        // interference edge between this move-related pair; later definitions
+        // still add normal edges if the two values actually diverge.  This is
+        // standard register coalescing and removes the per-iteration mv pair
+        // left by tail-recursion elimination/copy propagation.
+        int moveSrc = -1;
+        if (i > 0) {
+            const auto& prev = func.instrs[i - 1];
+            if (prev.type == IRInstrType::LOAD && prev.dest == func.instrs[i].src1)
+                moveSrc = std::stoi(prev.src1);
+        }
+        for (int s : liveOut[i]) {
+            if (s == moveSrc) continue;
+            addEdge(d, s);
+        }
     }
 
     // Coalescing hint: LOAD src; STORE dst is a pure copy.  Prefer assigning
