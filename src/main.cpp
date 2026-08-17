@@ -1,12 +1,11 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+
 #include "codegen/riscv_generator.h"
 #include "ir/ir_builder.h"
 #include "lexer/lexer.h"
-#include "opt/compile_time_evaluator.h"
 #include "opt/ir_optimizer.h"
-#include "opt/ir_compile_time_evaluator.h"
 #include "parser/parser.h"
 #include "semantic/semantic_checker.h"
 
@@ -17,6 +16,7 @@ int main(int argc, char* argv[]) {
             enableOpt = true;
         }
     }
+
     std::ostringstream buffer;
     buffer << std::cin.rdbuf();
     std::string source = buffer.str();
@@ -30,42 +30,15 @@ int main(int argc, char* argv[]) {
 
         toycc::SemanticChecker checker;
         checker.check(ast);
-        if (enableOpt) {
-            // Keep the tiny whole-program fast path, but abandon it quickly for large programs.
-            if (auto value = toycc::tryEvaluateMainAtCompileTime(ast, 20000ULL); value.has_value()) {
-                toycc::emitConstantMain(std::cout, *value);
-                return 0;
-            }
-        }
 
         toycc::IRBuilder builder;
         auto program = builder.build(ast, &checker);
 
         if (enableOpt) {
-            // Real IR optimization for larger performance tests: constant/copy propagation,
-            // local CSE, algebraic simplification and dead-code elimination.
             toycc::IROptimizer optimizer;
-            optimizer.optimizeForEvaluation(program);
-
-            // High-payoff whole-program fast path. Keep loops canonical for
-            // the host evaluator; backend-only unrolling/strength reduction is
-            // applied only if this bounded evaluation fails.
-            // passes, run a compact integer-only IR interpreter on the build
-            // host for at most ~15 s.  If main finishes, runtime work collapses
-            // to `li a0, result; ret`; otherwise the proven v7 backend remains
-            // the exact fallback.
-            if (auto value = toycc::tryEvaluateIRAtCompileTime(
-                    program, 24000000000ULL, 15000ULL); value.has_value()) {
-                toycc::emitConstantMain(std::cout, *value);
-                return 0;
-            }
-
-            // Evaluation failed: now reshape loops specifically for RISC-V
-            // fallback (true unrolling, induction strength reduction, etc.).
-            optimizer.optimizeForCodegen(program);
+            optimizer.optimize(program);
         }
 
-        // Functional tests keep the original path; -opt also enables backend optimizations.
         toycc::RiscvGenerator generator(std::cout, enableOpt);
         generator.generate(program);
     } catch (const std::exception& e) {

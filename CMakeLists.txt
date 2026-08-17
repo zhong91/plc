@@ -26,8 +26,6 @@ add_library(toycc_frontend
     src/codegen/riscv_generator_operands.cpp
     src/codegen/riscv_generator_store_forward.cpp
     src/codegen/riscv_generator_generate.cpp
-    src/opt/compile_time_evaluator.cpp
-    src/opt/ir_compile_time_evaluator.cpp
     src/opt/ir_optimizer.cpp
 )
 
@@ -43,17 +41,15 @@ target_link_libraries(compiler PRIVATE
     toycc_frontend
 )
 
-# The compiler itself is outside the runtime performance score.  Building the
-# host compiler with optimization makes bounded compile-time execution much
-# faster without changing non--opt ToyC semantics or generated fallback code.
+# Host-side optimization only affects compiler build speed; generated RISC-V
+# performance is determined by the explicit IR and backend optimization passes.
 if(MSVC)
     target_compile_options(toycc_frontend PRIVATE /O2)
     target_compile_options(compiler PRIVATE /O2)
 
-    # MSVC 14.43 can hit C1001 while optimizing the large RISC-V backend
-    # translation unit.  Keep the performance-critical compile-time evaluator
-    # at /O2, but compile only the code generator itself without host
-    # optimization.  This does not change the quality of generated RISC-V.
+    # MSVC 14.43 can hit C1001 while optimizing the larger optimizer/backend
+    # translation units. Compile those files conservatively on the host; this
+    # does not change the generated RISC-V optimization pipeline.
     set_source_files_properties(
         src/codegen/riscv_generator.cpp
     src/codegen/riscv_generator_alloc.cpp

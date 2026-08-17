@@ -1406,6 +1406,134 @@ bool removeJumpToNextLabel(IRFunction& func) {
 
 
 
+
+// Rotate the loop created by direct tail-recursion elimination into a
+// bottom-tested form.  The original layout branches from the loop header into
+// the recursive case and uses an unconditional jump back to the header.  After
+// rotation, the base-case block is moved after the loop and each steady-state
+// iteration ends with a single conditional branch.
+bool rotateTailRecursionLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 8) return false;
+
+    for (size_t back = n; back-- > 0;) {
+        if (func.instrs[back].type != IRInstrType::JUMP) continue;
+        const std::string header = func.instrs[back].label;
+        if (header.rfind(".tail_", 0) != 0) continue;
+
+        size_t h = back;
+        while (h > 0) {
+            --h;
+            if (func.instrs[h].type == IRInstrType::LABEL &&
+                func.instrs[h].label == header) break;
+        }
+        if (h >= back || func.instrs[h].type != IRInstrType::LABEL) continue;
+
+        size_t guard = n;
+        size_t body = n;
+        for (size_t k = h + 1; k < back; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t != IRInstrType::BRANCH_ZERO && t != IRInstrType::BRANCH_NONZERO)
+                continue;
+            for (size_t q = k + 1; q < back; ++q) {
+                if (func.instrs[q].type == IRInstrType::LABEL &&
+                    func.instrs[q].label == func.instrs[k].label) {
+                    guard = k;
+                    body = q;
+                    break;
+                }
+            }
+            if (guard != n) break;
+        }
+        if (guard == n || body == n || body <= guard + 1) continue;
+
+        // Guard computation must be side-effect-free and straight-line.
+        bool condSafe = true;
+        for (size_t k = h + 1; k < guard; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::LABEL || t == IRInstrType::JUMP ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                t == IRInstrType::CALL || t == IRInstrType::STORE_GLOBAL ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET) {
+                condSafe = false;
+                break;
+            }
+        }
+        if (!condSafe) continue;
+
+        // The fallthrough between guard and recursive body is the base case and
+        // must end in a jump leaving the loop.  Keep it verbatim, only move it.
+        if (func.instrs[body - 1].type != IRInstrType::JUMP) continue;
+        const std::string exitTarget = func.instrs[body - 1].label;
+        size_t exitPos = n;
+        for (size_t k = back + 1; k < n; ++k) {
+            if (func.instrs[k].type == IRInstrType::LABEL &&
+                func.instrs[k].label == exitTarget) {
+                exitPos = k;
+                break;
+            }
+        }
+        if (exitPos == n) continue;
+
+        bool baseSafe = true;
+        for (size_t k = guard + 1; k < body; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::CALL || t == IRInstrType::STORE_GLOBAL ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                (t == IRInstrType::JUMP && k + 1 != body)) {
+                baseSafe = false;
+                break;
+            }
+        }
+        if (!baseSafe) continue;
+
+        static std::uint64_t serial = 0;
+        const std::string done = ".tail_done_" + func.name + "_" +
+                                 std::to_string(serial++);
+        const std::string latch = ".tail_latch_" + func.name + "_" +
+                                  std::to_string(serial++);
+
+        std::vector<IRInstr> out;
+        out.reserve(n + (guard - h) + 3);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+        out.push_back(func.instrs[h]);
+
+        // Initial guard: enter body on the recursive condition, otherwise done.
+        for (size_t k = h + 1; k < guard; ++k) out.push_back(func.instrs[k]);
+        IRInstr initial = func.instrs[guard];
+        initial.type = initial.type == IRInstrType::BRANCH_ZERO
+            ? IRInstrType::BRANCH_NONZERO
+            : IRInstrType::BRANCH_ZERO;
+        initial.label = done;
+        out.push_back(std::move(initial));
+
+        // Recursive body (including its original entry label). Continues or
+        // explicit jumps to the tail header are redirected to the latch.
+        for (size_t k = body; k < back; ++k) {
+            IRInstr ins = func.instrs[k];
+            if (ins.type == IRInstrType::JUMP && ins.label == header)
+                ins.label = latch;
+            out.push_back(std::move(ins));
+        }
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", latch);
+        for (size_t k = h + 1; k < guard; ++k) out.push_back(func.instrs[k]);
+        IRInstr loopBack = func.instrs[guard];
+        loopBack.label = func.instrs[body].label;
+        out.push_back(std::move(loopBack));
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", done);
+        for (size_t k = guard + 1; k < body; ++k) out.push_back(func.instrs[k]);
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
 // Sink loop-final copies out of a simple loop.
 //
 // After available-copy propagation, copy benchmarks commonly contain
@@ -2005,7 +2133,10 @@ bool unrollSimpleLoops(IRFunction& func) {
         // Tiny hot loops benefit from a wider unroll because branch overhead is
         // a large fraction of their dynamic work.  Keep 4x for medium bodies to
         // avoid excessive code growth/instruction-cache pressure.
-        const int unrollFactor = bodyLen <= 12 ? 8 : 4;
+        // Tiny straight-line loops are dominated by branch/control overhead.
+        // A 16x factor is still small when the body has <= 8 IR instructions;
+        // larger loops retain the previous conservative factors.
+        const int unrollFactor = bodyLen <= 8 ? 16 : (bodyLen <= 16 ? 8 : 4);
         const long long fastBound=bound-static_cast<long long>(unrollFactor-1)*step;
         if(fastBound<std::numeric_limits<int32_t>::min()||fastBound>std::numeric_limits<int32_t>::max()) continue;
 
@@ -2069,10 +2200,9 @@ bool unrollSimpleLoops(IRFunction& func) {
 }
 
 void optimizeFunctionCommon(IRFunction& func) {
-    // Keep the IR structurally simple before host evaluation. Tail-recursion
-    // conversion, propagation, CSE and DCE help both the evaluator and backend;
-    // loop unrolling/strength reduction are deliberately deferred until host
-    // evaluation has failed.
+    // Canonical scalar cleanup. Keep loops recognizable while performing
+    // propagation, CSE, DCE and tail-recursion elimination; loop-specific
+    // transformations are applied in the code-generation stage.
     eliminateDirectTailRecursion(func);
     for (int round = 0; round < 4; ++round) {
         bool changed = false;
@@ -2092,6 +2222,10 @@ void optimizeFunctionCommon(IRFunction& func) {
         if (!changed) break;
     }
 
+    // Direct tail calls are now ordinary loops; rotate them to a single
+    // conditional back edge before later inlining/code generation.
+    rotateTailRecursionLoop(func);
+
     // Only after destination-slot forwarding has had all optimizer rounds to
     // consume inlined returns, remove the remaining a0->t0 convention for
     // expression-valued inlines that have no immediate STORE destination.
@@ -2101,6 +2235,8 @@ void optimizeFunctionCommon(IRFunction& func) {
         removeJumpToNextLabel(func);
     }
 }
+
+bool rotateCanonicalWhileLoops(IRFunction& func);
 
 void optimizeFunctionForCodegen(IRFunction& func) {
     // The individual strength-reduction helpers intentionally rewrite one
@@ -2133,8 +2269,205 @@ void optimizeFunctionForCodegen(IRFunction& func) {
     // original scalar loop as a remainder path, so repeatedly invoking the
     // matcher could select that tail again and duplicate it.
     unrollSimpleLoops(func);
+
+    // Branch-heavy loops are not eligible for straight-line unrolling. Rotate
+    // those canonical while loops to a bottom test to remove one unconditional
+    // jump per iteration (continues are retargeted to the latch).
+    rotateCanonicalWhileLoops(func);
+
+    // Loop transforms often expose fresh copy/dead-store opportunities.  A
+    // short cleanup fixed point keeps the final IR compact without reapplying
+    // code-growth transforms.
+    for (int round = 0; round < 3; ++round) {
+        bool changed = false;
+        changed |= propagateConstantsAcrossCFG(func);
+        changed |= propagateCopiesAcrossCFG(func);
+        changed |= simplifyLocally(func);
+        changed |= removeUnreachableAfterJump(func);
+        changed |= eliminateUnreachableCFG(func);
+        changed |= eliminateDeadStores(func);
+        changed |= eliminateDeadRegisterComputations(func);
+        changed |= removeRedundantSelfCopies(func);
+        changed |= removeJumpToNextLabel(func);
+        if (!changed) break;
+    }
 }
 
+
+
+// Rotate a canonical while-loop into an initial guard plus a bottom-tested loop.
+// This removes the unconditional back-edge jump from branch-heavy loops that
+// cannot be handled by the straight-line unroller.  Internal `continue` jumps
+// to the header are retargeted to the duplicated latch condition, preserving
+// while-loop semantics.  The condition itself must be a side-effect-free
+// straight-line IR sequence.
+bool rotateCanonicalWhileLoops(IRFunction& func) {
+    static std::uint64_t serial = 0;
+    bool changed = false;
+
+    for (size_t j = func.instrs.size(); j-- > 0;) {
+        if (func.instrs[j].type != IRInstrType::JUMP) continue;
+        const std::string header = func.instrs[j].label;
+
+        size_t h = j;
+        while (h > 0) {
+            --h;
+            if (func.instrs[h].type == IRInstrType::LABEL &&
+                func.instrs[h].label == header) break;
+        }
+        if (h >= j || func.instrs[h].type != IRInstrType::LABEL ||
+            func.instrs[h].label != header) continue;
+        if (j + 1 >= func.instrs.size() ||
+            func.instrs[j + 1].type != IRInstrType::LABEL) continue;
+
+        const std::string exitLabel = func.instrs[j + 1].label;
+
+        // The first branch to the exit label is the canonical while guard.
+        size_t guard = func.instrs.size();
+        bool guardSafe = true;
+        for (size_t k = h + 1; k < j; ++k) {
+            const auto t = func.instrs[k].type;
+            if ((t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO) &&
+                func.instrs[k].label == exitLabel) {
+                guard = k;
+                break;
+            }
+            if (t == IRInstrType::LABEL || t == IRInstrType::JUMP ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                t == IRInstrType::CALL || t == IRInstrType::STORE_GLOBAL ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET) {
+                guardSafe = false;
+                break;
+            }
+        }
+        if (!guardSafe || guard == func.instrs.size() || guard == h + 1) continue;
+        const auto guardType = func.instrs[guard].type;
+        if (guardType != IRInstrType::BRANCH_ZERO &&
+            guardType != IRInstrType::BRANCH_NONZERO) continue;
+
+        // Do not rotate a loop with another backward edge to an internal label.
+        bool extraBackedge = false;
+        std::unordered_map<std::string, size_t> labels;
+        for (size_t k = h; k <= j; ++k)
+            if (func.instrs[k].type == IRInstrType::LABEL)
+                labels[func.instrs[k].label] = k;
+        for (size_t k = guard + 1; k < j; ++k) {
+            const auto& ins = func.instrs[k];
+            if (ins.type != IRInstrType::JUMP &&
+                ins.type != IRInstrType::BRANCH_ZERO &&
+                ins.type != IRInstrType::BRANCH_NONZERO) continue;
+            auto it = labels.find(ins.label);
+            if (it != labels.end() && it->second < k && ins.label != header) {
+                extraBackedge = true;
+                break;
+            }
+        }
+        if (extraBackedge) continue;
+
+        const std::string suffix = std::to_string(serial++);
+        const std::string bodyLabel = ".rot_body_" + func.name + "_" + suffix;
+        const std::string latchLabel = ".rot_latch_" + func.name + "_" + suffix;
+
+        std::vector<IRInstr> out;
+        out.reserve(func.instrs.size() + (guard - h) + 3);
+
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+        out.push_back(func.instrs[h]);
+
+        // Initial zero-trip guard remains unchanged.
+        for (size_t k = h + 1; k <= guard; ++k) out.push_back(func.instrs[k]);
+        out.emplace_back(IRInstrType::LABEL, "", "", "", bodyLabel);
+
+        // Body: continue/back-edge jumps now go to the latch condition.
+        for (size_t k = guard + 1; k < j; ++k) {
+            IRInstr ins = func.instrs[k];
+            if (ins.type == IRInstrType::JUMP && ins.label == header)
+                ins.label = latchLabel;
+            out.push_back(std::move(ins));
+        }
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", latchLabel);
+        // Recompute the original side-effect-free condition.
+        for (size_t k = h + 1; k < guard; ++k) out.push_back(func.instrs[k]);
+
+        IRInstr back = func.instrs[guard];
+        back.type = (guardType == IRInstrType::BRANCH_ZERO)
+            ? IRInstrType::BRANCH_NONZERO
+            : IRInstrType::BRANCH_ZERO;
+        back.label = bodyLabel;
+        out.push_back(std::move(back));
+
+        // Keep the original exit label and all following code.
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(j + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        changed = true;
+
+        // Rebuild indices before attempting another loop.
+        j = func.instrs.size();
+    }
+    return changed;
+}
+
+// Whole-program dead-function elimination.  ToyC has no function pointers and
+// the executable entry point is main, so any function not reachable from main
+// through CALL instructions cannot affect program behaviour.
+bool eliminateUnreachableFunctions(IRProgram& program) {
+    std::unordered_map<std::string, size_t> index;
+    for (size_t i = 0; i < program.functions.size(); ++i)
+        index[program.functions[i].name] = i;
+    auto mainIt = index.find("main");
+    if (mainIt == index.end()) return false;
+
+    std::vector<char> live(program.functions.size(), 0);
+    std::vector<size_t> work{mainIt->second};
+    live[mainIt->second] = 1;
+    while (!work.empty()) {
+        const size_t fi = work.back();
+        work.pop_back();
+        for (const auto& ins : program.functions[fi].instrs) {
+            if (ins.type != IRInstrType::CALL) continue;
+            auto it = index.find(ins.src1);
+            if (it == index.end() || live[it->second]) continue;
+            live[it->second] = 1;
+            work.push_back(it->second);
+        }
+    }
+
+    std::vector<IRFunction> kept;
+    kept.reserve(program.functions.size());
+    bool changed = false;
+    for (size_t i = 0; i < program.functions.size(); ++i) {
+        if (live[i]) kept.push_back(program.functions[i]);
+        else changed = true;
+    }
+    if (changed) program.functions.swap(kept);
+    return changed;
+}
+
+// Remove globals that are no longer referenced after constant propagation.
+// The whole ToyC translation unit is available to the compiler and the language
+// has no address-taking, so an unreferenced global has no observable effect.
+bool eliminateUnusedGlobals(IRProgram& program) {
+    if (program.globalVars.empty()) return false;
+    std::unordered_set<std::string> used;
+    for (const auto& f : program.functions) {
+        for (const auto& ins : f.instrs) {
+            if (ins.type == IRInstrType::LOAD_GLOBAL) used.insert(ins.src1);
+            else if (ins.type == IRInstrType::STORE_GLOBAL) used.insert(ins.src1);
+        }
+    }
+    std::vector<std::pair<std::string, int>> kept;
+    kept.reserve(program.globalVars.size());
+    bool changed = false;
+    for (auto& g : program.globalVars) {
+        if (used.count(g.first)) kept.push_back(g);
+        else changed = true;
+    }
+    if (changed) program.globalVars.swap(kept);
+    return changed;
+}
 
 bool isLeafInlineCandidate(const IRFunction& f, size_t maxInstr, int maxLocal) {
     if (f.name == "main" || f.paramCount > 8 || f.instrs.size() > maxInstr || f.localSize > maxLocal) return false;
@@ -2236,7 +2569,7 @@ bool propagateImmutableGlobals(IRProgram& program) {
 
 } // namespace
 
-void IROptimizer::optimizeForEvaluation(IRProgram& program) const {
+void IROptimizer::optimizeScalar(IRProgram& program) const {
     propagateImmutableGlobals(program);
     for (auto& func : program.functions) optimizeFunctionCommon(func);
 
@@ -2248,6 +2581,9 @@ void IROptimizer::optimizeForEvaluation(IRProgram& program) const {
     for (int round = 0; round < 6; ++round) {
         if (!inlineSmallLeafFunctions(program)) break;
     }
+
+    eliminateUnreachableFunctions(program);
+    eliminateUnusedGlobals(program);
 }
 
 void IROptimizer::optimizeForCodegen(IRProgram& program) const {
@@ -2255,8 +2591,10 @@ void IROptimizer::optimizeForCodegen(IRProgram& program) const {
 }
 
 void IROptimizer::optimize(IRProgram& program) const {
-    optimizeForEvaluation(program);
+    optimizeScalar(program);
     optimizeForCodegen(program);
+    eliminateUnreachableFunctions(program);
+    eliminateUnusedGlobals(program);
 }
 
 } // namespace toycc
