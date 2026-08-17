@@ -332,7 +332,9 @@ bool simplifyLocally(IRFunction& func) {
                     if (b.kind == ValueKind::Constant && b.constant == 0) {
                         ins.type = IRInstrType::MV; ins.src1 = original.src1; ins.src2.clear();
                         st.setReg(ins.dest, a); replaced = true;
-                    } else if (original.src1 == original.src2) {
+                    } else if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
+                        // x - x = 0 even when the two values arrived through
+                        // different temporary registers/copy chains.
                         ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
                         st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
                     }
@@ -352,9 +354,31 @@ bool simplifyLocally(IRFunction& func) {
                     if (b.kind == ValueKind::Constant && b.constant == 1) {
                         ins.type = IRInstrType::MV; ins.src1 = original.src1; ins.src2.clear();
                         st.setReg(ins.dest, a); replaced = true;
+                    } else if (a.kind == ValueKind::Constant && a.constant == 0 &&
+                               b.kind == ValueKind::Constant && b.constant != 0) {
+                        ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
+                        st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
+                    } else if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
+                        // In a defined ToyC execution x/x is only evaluated for x!=0.
+                        ins.type = IRInstrType::LI; ins.src1 = "1"; ins.src2.clear();
+                        st.setReg(ins.dest, Value::constantValue(1)); replaced = true;
                     }
                 } else if (ins.type == IRInstrType::REM) {
                     if (b.kind == ValueKind::Constant && (b.constant == 1 || b.constant == -1)) {
+                        ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
+                        st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
+                    } else if (a.kind == ValueKind::Constant && a.constant == 0 &&
+                               b.kind == ValueKind::Constant && b.constant != 0) {
+                        ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
+                        st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
+                    } else if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
+                        // Defined x%x is always zero; division-by-zero inputs are UB
+                        // and are excluded by the ToyC test contract.
+                        ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
+                        st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
+                    }
+                } else if (ins.type == IRInstrType::SLT) {
+                    if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
                         ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
                         st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
                     }
@@ -389,8 +413,7 @@ bool simplifyLocally(IRFunction& func) {
 
                 std::string key;
                 const bool expensive = ins.type==IRInstrType::MUL || ins.type==IRInstrType::DIV || ins.type==IRInstrType::REM;
-                if (cseOp && (expensive ? (stableForCse(a)&&stableForCse(b))
-                                       : (atomicForCse(a)&&atomicForCse(b)))) {
+                if (cseOp && stableForCse(a) && stableForCse(b)) {
                     key = makeExprKey(ins.type, a, b);
                 }
                 if (!key.empty()) {
@@ -2211,6 +2234,318 @@ bool summarizeAffineCountedLoop(IRFunction& func) {
 }
 
 
+// Summarize a broader class of straight-line counted loops whose carried state
+// is an affine transformation.  Unlike the removed whole-program evaluator,
+// this pass never executes control flow or calls: it recognizes one canonical
+// natural loop, builds its one-iteration affine state transition, and applies
+// that transition with exponentiation by squaring.  The transform is limited to
+// side-effect-free local integer loops with constant entry state and a proven
+// positive induction step.
+bool summarizeLinearStateCountedLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 10) return false;
+
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL)
+            labels[func.instrs[i].label] = i;
+
+    for (size_t back = n; back-- > 0;) {
+        if (func.instrs[back].type != IRInstrType::JUMP) continue;
+        auto hit = labels.find(func.instrs[back].label);
+        if (hit == labels.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+        if (back + 1 >= n || func.instrs[back + 1].type != IRInstrType::LABEL)
+            continue;
+        const std::string exitLabel = func.instrs[back + 1].label;
+
+        int headerJumps = 0;
+        for (const auto& x : func.instrs)
+            if (x.type == IRInstrType::JUMP && x.label == func.instrs[back].label)
+                ++headerJumps;
+        if (headerJumps != 1) continue;
+
+        size_t guard = n;
+        int guardCount = 0;
+        bool safe = true;
+        for (size_t k = h + 1; k < back; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::CALL || t == IRInstrType::STORE_GLOBAL ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET ||
+                t == IRInstrType::JUMP || t == IRInstrType::LABEL) {
+                safe = false; break;
+            }
+            if (t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO) {
+                if (func.instrs[k].label != exitLabel) { safe = false; break; }
+                ++guardCount; guard = k;
+            }
+        }
+        if (!safe || guardCount != 1 || guard < h + 4 || back < 4) continue;
+
+        const auto& g0 = func.instrs[guard - 3];
+        const auto& g1 = func.instrs[guard - 2];
+        const auto& g2 = func.instrs[guard - 1];
+        const auto& gb = func.instrs[guard];
+        if (g0.type != IRInstrType::LI || g0.dest != "t0" ||
+            g1.type != IRInstrType::LOAD || g1.dest != "t1" ||
+            g2.type != IRInstrType::SLT || g2.dest != "t0" ||
+            g2.src1 != "t1" || g2.src2 != "t0" ||
+            gb.type != IRInstrType::BRANCH_ZERO || gb.src1 != "t0")
+            continue;
+
+        int iv = -1;
+        if (!parseSlot(g1.src1, iv)) continue;
+        long long bound = 0;
+        try { bound = std::stoll(g0.src1); } catch (...) { continue; }
+        if (bound < std::numeric_limits<std::int32_t>::min() ||
+            bound > std::numeric_limits<std::int32_t>::max()) continue;
+
+        const size_t stepStart = back - 4;
+        const auto& s0 = func.instrs[stepStart];
+        const auto& s1 = func.instrs[stepStart + 1];
+        const auto& s2 = func.instrs[stepStart + 2];
+        const auto& s3 = func.instrs[stepStart + 3];
+        int ivLoad = -1, ivStore = -2;
+        if (s0.type != IRInstrType::LI || s0.dest != "t0" ||
+            s1.type != IRInstrType::LOAD || s1.dest != "t1" ||
+            !parseSlot(s1.src1, ivLoad) || ivLoad != iv ||
+            s2.type != IRInstrType::ADD || s2.dest != "t0" ||
+            s2.src1 != "t1" || s2.src2 != "t0" ||
+            s3.type != IRInstrType::STORE || s3.src1 != "t0" ||
+            !parseSlot(s3.src2, ivStore) || ivStore != iv)
+            continue;
+        long long step = 0;
+        try { step = std::stoll(s0.src1); } catch (...) { continue; }
+        if (step <= 0 || step > 1000000000LL) continue;
+
+        int ivStores = 0;
+        std::unordered_set<int> modified;
+        for (size_t k = guard + 1; k < back; ++k) {
+            if (auto d = slotDef(func.instrs[k])) {
+                modified.insert(*d);
+                if (*d == iv) ++ivStores;
+            }
+        }
+        if (ivStores != 1) continue;
+
+        auto initIv = straightLineConstBefore(func, h, iv);
+        if (!initIv) continue;
+        const std::int64_t init = *initIv;
+        std::int64_t trips = 0;
+        if (init < bound) {
+            const std::int64_t diff = bound - init;
+            trips = (diff + step - 1) / step;
+        }
+        if (trips < 2) continue;
+
+        std::unordered_map<std::string, AffineLoopExpr> regs;
+        std::unordered_map<int, AffineLoopExpr> slots;
+        auto reg = [&](const std::string& r) -> AffineLoopExpr {
+            auto it = regs.find(r);
+            if (it == regs.end()) { AffineLoopExpr bad; bad.valid = false; return bad; }
+            return it->second;
+        };
+        auto loadSlot = [&](int slot) -> AffineLoopExpr {
+            auto it = slots.find(slot);
+            if (it != slots.end()) return it->second;
+            if (!modified.count(slot) && slot != iv) {
+                if (auto c = straightLineConstBefore(func, h, slot))
+                    return affineConstant(*c);
+            }
+            return affineIdentity(slot);
+        };
+
+        bool symbolicOK = true;
+        for (size_t k = guard + 1; k < back && symbolicOK; ++k) {
+            const auto& ins = func.instrs[k];
+            switch (ins.type) {
+                case IRInstrType::LI: {
+                    long long v = 0; try { v = std::stoll(ins.src1); }
+                    catch (...) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(v); break;
+                }
+                case IRInstrType::LOAD: {
+                    int q = -1; if (!parseSlot(ins.src1, q)) { symbolicOK = false; break; }
+                    regs[ins.dest] = loadSlot(q); break;
+                }
+                case IRInstrType::STORE: {
+                    int q = -1; if (!parseSlot(ins.src2, q)) { symbolicOK = false; break; }
+                    auto e = reg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    slots[q] = std::move(e); break;
+                }
+                case IRInstrType::MV: {
+                    auto e = reg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::ADD:
+                case IRInstrType::SUB: {
+                    auto e = affineAdd(reg(ins.src1), reg(ins.src2),
+                                       ins.type == IRInstrType::ADD ? 1 : -1);
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::MUL: {
+                    auto a = reg(ins.src1), b = reg(ins.src2);
+                    std::int64_t ca = 0, cb = 0; AffineLoopExpr e;
+                    if (affineIsConstant(a, ca)) e = affineScale(b, ca);
+                    else if (affineIsConstant(b, cb)) e = affineScale(a, cb);
+                    else e.valid = false;
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::DIV:
+                case IRInstrType::REM:
+                case IRInstrType::SLT: {
+                    auto a = reg(ins.src1), b = reg(ins.src2);
+                    std::int64_t ca = 0, cb = 0;
+                    if (!affineIsConstant(a, ca) || !affineIsConstant(b, cb) ||
+                        ca < std::numeric_limits<std::int32_t>::min() ||
+                        ca > std::numeric_limits<std::int32_t>::max() ||
+                        cb < std::numeric_limits<std::int32_t>::min() ||
+                        cb > std::numeric_limits<std::int32_t>::max()) {
+                        symbolicOK = false; break;
+                    }
+                    auto v = foldBinary(ins.type, static_cast<std::int32_t>(ca),
+                                        static_cast<std::int32_t>(cb));
+                    if (!v) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(*v); break;
+                }
+                case IRInstrType::SEQZ:
+                case IRInstrType::SNEZ: {
+                    auto a = reg(ins.src1); std::int64_t c = 0;
+                    if (!affineIsConstant(a, c)) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(
+                        ins.type == IRInstrType::SEQZ ? (c == 0 ? 1 : 0)
+                                                     : (c != 0 ? 1 : 0));
+                    break;
+                }
+                default:
+                    symbolicOK = false; break;
+            }
+        }
+        if (!symbolicOK) continue;
+
+        // Roots are values observable after the loop.  Add modified dependency
+        // slots transitively so copy chains / mutually dependent affine state
+        // are represented in the transition matrix.
+        std::unordered_set<int> stateSet;
+        for (int q : modified)
+            if (slotLoadedAfter(func, back + 1, q)) stateSet.insert(q);
+        if (slotLoadedAfter(func, back + 1, iv)) stateSet.insert(iv);
+        if (stateSet.empty()) continue;
+
+        bool depsOK = true, grew = true;
+        while (grew && depsOK) {
+            grew = false;
+            std::vector<int> cur(stateSet.begin(), stateSet.end());
+            for (int q : cur) {
+                AffineLoopExpr e = slots.count(q) ? slots[q] : affineIdentity(q);
+                if (!e.valid) { depsOK = false; break; }
+                for (const auto& [dep, coeff] : e.coeff) {
+                    if (coeff == 0 || stateSet.count(dep)) continue;
+                    if (modified.count(dep) || dep == iv) {
+                        stateSet.insert(dep); grew = true;
+                    } else {
+                        // Unmodified non-constant dependencies should have been
+                        // folded by loadSlot().  Reject rather than guess.
+                        depsOK = false; break;
+                    }
+                }
+                if (!depsOK) break;
+            }
+        }
+        if (!depsOK || stateSet.empty() || stateSet.size() > 16) continue;
+
+        std::vector<int> state(stateSet.begin(), stateSet.end());
+        std::sort(state.begin(), state.end());
+        std::unordered_map<int, size_t> pos;
+        for (size_t i = 0; i < state.size(); ++i) pos[state[i]] = i;
+        const size_t D = state.size() + 1;
+
+        std::vector<std::uint32_t> initVec(D, 0);
+        bool initOK = true;
+        for (size_t i = 0; i < state.size(); ++i) {
+            auto c = straightLineConstBefore(func, h, state[i]);
+            if (!c) { initOK = false; break; }
+            initVec[i] = static_cast<std::uint32_t>(*c);
+        }
+        if (!initOK) continue;
+        initVec[D - 1] = 1;
+
+        std::vector<std::uint32_t> M(D * D, 0);
+        bool matrixOK = true;
+        for (size_t r = 0; r < state.size(); ++r) {
+            AffineLoopExpr e = slots.count(state[r]) ? slots[state[r]]
+                                                     : affineIdentity(state[r]);
+            if (!e.valid) { matrixOK = false; break; }
+            for (const auto& [dep, coeff] : e.coeff) {
+                auto it = pos.find(dep);
+                if (it == pos.end()) { matrixOK = false; break; }
+                M[r * D + it->second] += static_cast<std::uint32_t>(coeff);
+            }
+            if (!matrixOK) break;
+            M[r * D + (D - 1)] += static_cast<std::uint32_t>(e.constant);
+        }
+        if (!matrixOK) continue;
+        M[(D - 1) * D + (D - 1)] = 1;
+
+        auto mulMat = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& B) {
+            std::vector<std::uint32_t> C(D * D, 0);
+            for (size_t i = 0; i < D; ++i) {
+                for (size_t k = 0; k < D; ++k) {
+                    const std::uint32_t aik = A[i * D + k];
+                    if (aik == 0) continue;
+                    for (size_t j = 0; j < D; ++j) {
+                        C[i * D + j] += static_cast<std::uint32_t>(
+                            static_cast<std::uint64_t>(aik) * B[k * D + j]);
+                    }
+                }
+            }
+            return C;
+        };
+        auto mulVec = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& x) {
+            std::vector<std::uint32_t> y(D, 0);
+            for (size_t i = 0; i < D; ++i)
+                for (size_t j = 0; j < D; ++j)
+                    y[i] += static_cast<std::uint32_t>(
+                        static_cast<std::uint64_t>(A[i * D + j]) * x[j]);
+            return y;
+        };
+
+        std::vector<std::uint32_t> P(D * D, 0);
+        for (size_t i = 0; i < D; ++i) P[i * D + i] = 1;
+        std::vector<std::uint32_t> B = M;
+        std::uint64_t eN = static_cast<std::uint64_t>(trips);
+        while (eN) {
+            if (eN & 1ULL) P = mulMat(P, B);
+            eN >>= 1ULL;
+            if (eN) B = mulMat(B, B);
+        }
+        const auto finalVec = mulVec(P, initVec);
+
+        // Only materialize values actually observed after the loop.  Internal
+        // dependency state disappears with the loop itself.
+        std::vector<IRInstr> out;
+        out.reserve(n - (back - h + 1) + state.size() * 2);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+        for (size_t i = 0; i < state.size(); ++i) {
+            if (!slotLoadedAfter(func, back + 1, state[i])) continue;
+            const std::int32_t v = static_cast<std::int32_t>(finalVec[i]);
+            out.emplace_back(IRInstrType::LI, "t0", std::to_string(v));
+            out.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(state[i]));
+        }
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
+
 // Periodic remainder-loop specialization.
 //
 // For a canonical counted loop whose internal branches are driven by direct
@@ -3362,12 +3697,631 @@ bool unrollSimpleLoops(IRFunction& func) {
     return changed;
 }
 
+// Unroll the bottom-tested loop produced by direct tail-recursion elimination.
+// The transform is deliberately restricted to the compiler-generated
+// `.tail_latch_` shape and a positive constant countdown value.  It preserves
+// the scalar loop as a remainder path, so recursion semantics are unchanged
+// while the hot path executes one branch per 16 source tail calls.
+bool unrollTailCountdownLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 12) return false;
+    static std::uint64_t serial = 0;
+
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL)
+            labels[func.instrs[i].label] = i;
+
+    for (size_t back = n; back-- > 0;) {
+        const auto& br = func.instrs[back];
+        if (br.type != IRInstrType::BRANCH_NONZERO &&
+            br.type != IRInstrType::BRANCH_ZERO) continue;
+        auto hit = labels.find(br.label);
+        if (hit == labels.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+
+        // Locate the compiler-generated tail latch inside this natural loop.
+        size_t latch = n;
+        for (size_t k = h + 1; k < back; ++k) {
+            if (func.instrs[k].type == IRInstrType::LABEL &&
+                func.instrs[k].label.find(".tail_latch_") != std::string::npos)
+                latch = k;
+        }
+        if (latch == n || latch + 2 >= back + 1) continue;
+
+        // Exact latch condition generated by tail-recursion rotation:
+        //   LOAD x; SEQZ x; BRANCH_ZERO header
+        // or the logically equivalent SNEZ + BRANCH_NONZERO form.
+        const auto& ld = func.instrs[latch + 1];
+        const auto& nz = func.instrs[latch + 2];
+        const bool nonzeroBack =
+            (nz.type == IRInstrType::SEQZ && br.type == IRInstrType::BRANCH_ZERO) ||
+            (nz.type == IRInstrType::SNEZ && br.type == IRInstrType::BRANCH_NONZERO);
+        if (latch + 3 != back ||
+            ld.type != IRInstrType::LOAD || !nonzeroBack ||
+            nz.dest != ld.dest || nz.src1 != ld.dest || br.src1 != nz.dest)
+            continue;
+        int condSlot = -1;
+        if (!parseSlot(ld.src1, condSlot)) continue;
+
+        // The condition temporary is copied to the real countdown parameter in
+        // the body.  Recover that carried slot so the fast-entry guard can test
+        // a value that is initialized before the first iteration.
+        int countdownSlot = -1;
+        for (size_t k = h + 1; k + 1 < latch; ++k) {
+            const auto& a = func.instrs[k];
+            const auto& b = func.instrs[k + 1];
+            int src = -1, dst = -1;
+            if (a.type == IRInstrType::LOAD && a.dest == "t0" &&
+                b.type == IRInstrType::STORE && b.src1 == "t0" &&
+                parseSlot(a.src1, src) && src == condSlot &&
+                parseSlot(b.src2, dst)) {
+                countdownSlot = dst;
+            }
+        }
+        if (countdownSlot < 0) continue;
+        size_t initHeader = h;
+        while (initHeader > 0 && func.instrs[initHeader - 1].type == IRInstrType::LABEL)
+            --initHeader;
+        auto init = straightLineConstBefore(func, initHeader, countdownSlot);
+        if (!init || *init < 16) continue;
+
+        // No control flow or observable side effects inside one generated tail
+        // iteration.  Labels at the very front are harmless aliases; labels
+        // inside the body would be duplicated and are therefore rejected.
+        size_t bodyBegin = h + 1;
+        while (bodyBegin < latch && func.instrs[bodyBegin].type == IRInstrType::LABEL)
+            ++bodyBegin;
+        if (bodyBegin >= latch) continue;
+        bool safe = true;
+        for (size_t k = bodyBegin; k < latch; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::LABEL || t == IRInstrType::JUMP ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                t == IRInstrType::CALL || t == IRInstrType::STORE_GLOBAL ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET) {
+                safe = false; break;
+            }
+        }
+        if (!safe) continue;
+
+        constexpr int F = 16;
+        const std::string fastGuard = ".tail_u16_guard_" + func.name + "_" +
+                                      std::to_string(serial);
+        const std::string fastBody = ".tail_u16_body_" + func.name + "_" +
+                                     std::to_string(serial);
+        const std::string tail = ".tail_u16_tail_" + func.name + "_" +
+                                 std::to_string(serial++);
+
+        std::vector<IRInstr> out;
+        out.reserve(n + (latch - bodyBegin) * (F - 1) + 12);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", fastGuard);
+        out.emplace_back(IRInstrType::LI, "t0", std::to_string(F));
+        out.emplace_back(IRInstrType::LOAD, "t1", std::to_string(countdownSlot));
+        out.emplace_back(IRInstrType::SLT, "t0", "t1", "t0"); // countdown < F
+        out.emplace_back(IRInstrType::BRANCH_NONZERO, "", "t0", "", tail);
+        out.emplace_back(IRInstrType::LABEL, "", "", "", fastBody);
+
+        for (int copy = 0; copy < F; ++copy)
+            out.insert(out.end(), func.instrs.begin() + static_cast<long>(bodyBegin),
+                       func.instrs.begin() + static_cast<long>(latch));
+        out.emplace_back(IRInstrType::JUMP, "", "", "", fastGuard);
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", tail);
+        // If the chunked path lands exactly on zero, skip the original
+        // do-while-shaped scalar remainder.  Otherwise it handles 1..15 trips.
+        const std::string doneLabel =
+            (back + 1 < n && func.instrs[back + 1].type == IRInstrType::LABEL)
+                ? func.instrs[back + 1].label : std::string{};
+        if (doneLabel.empty()) continue;
+        out.emplace_back(IRInstrType::LOAD, "t0", std::to_string(countdownSlot));
+        out.emplace_back(IRInstrType::BRANCH_ZERO, "", "t0", "", doneLabel);
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(h),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
+
+// Collapse the same post-inline unit-countdown tail loop when its carried local
+// state is affine.  The trip count is proven from the positive constant entry
+// countdown and the exact `countdown' = countdown - 1` recurrence.  One loop
+// iteration is represented symbolically, then the affine transition is raised
+// to N with exponentiation by squaring.  This is structural recurrence analysis,
+// not interpretation of the function or main().
+bool summarizeInlinedUnitCountdownLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 12) return false;
+
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL)
+            labels[func.instrs[i].label] = i;
+
+    for (size_t back = n; back-- > 0;) {
+        const auto& br = func.instrs[back];
+        if (br.type != IRInstrType::BRANCH_ZERO &&
+            br.type != IRInstrType::BRANCH_NONZERO)
+            continue;
+        auto hit = labels.find(br.label);
+        if (hit == labels.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+        if (br.label.find(".inl") == std::string::npos || back < h + 5 || back < 2)
+            continue;
+
+        const auto& condLoad = func.instrs[back - 2];
+        const auto& condNorm = func.instrs[back - 1];
+        const bool continueOnNonzero =
+            (condNorm.type == IRInstrType::SEQZ && br.type == IRInstrType::BRANCH_ZERO) ||
+            (condNorm.type == IRInstrType::SNEZ && br.type == IRInstrType::BRANCH_NONZERO);
+        if (!continueOnNonzero || condLoad.type != IRInstrType::LOAD ||
+            condNorm.dest != condLoad.dest || condNorm.src1 != condLoad.dest ||
+            br.src1 != condNorm.dest)
+            continue;
+
+        int condSlot = -1;
+        if (!parseSlot(condLoad.src1, condSlot)) continue;
+        const size_t bodyBegin = h + 1;
+        const size_t bodyEnd = back - 2;
+        if (bodyBegin >= bodyEnd) continue;
+
+        bool safe = true;
+        std::unordered_set<int> modified;
+        for (size_t k = bodyBegin; k < bodyEnd; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::LABEL || t == IRInstrType::JUMP ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                t == IRInstrType::CALL || t == IRInstrType::LOAD_GLOBAL ||
+                t == IRInstrType::STORE_GLOBAL || t == IRInstrType::LOAD_ARG ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET) {
+                safe = false; break;
+            }
+            if (auto d = slotDef(func.instrs[k])) modified.insert(*d);
+        }
+        if (!safe) continue;
+
+        int countdownSlot = -1;
+        for (size_t k = bodyBegin; k + 1 < bodyEnd; ++k) {
+            const auto& a = func.instrs[k];
+            const auto& b = func.instrs[k + 1];
+            int src = -1, dst = -1;
+            if (a.type == IRInstrType::LOAD &&
+                b.type == IRInstrType::STORE && b.src1 == a.dest &&
+                parseSlot(a.src1, src) && src == condSlot &&
+                parseSlot(b.src2, dst) && dst != condSlot) {
+                if (countdownSlot != -1 && countdownSlot != dst) {
+                    countdownSlot = -2; break;
+                }
+                countdownSlot = dst;
+            }
+        }
+        if (countdownSlot < 0) continue;
+
+        bool unitDecrement = false;
+        for (size_t k = bodyBegin; k + 3 < bodyEnd; ++k) {
+            const auto& i0 = func.instrs[k];
+            const auto& i1 = func.instrs[k + 1];
+            const auto& i2 = func.instrs[k + 2];
+            const auto& i3 = func.instrs[k + 3];
+            int loadSlot = -1, storeSlot = -1;
+            if (i0.type != IRInstrType::LI || i1.type != IRInstrType::LOAD ||
+                i3.type != IRInstrType::STORE || i3.src1 != i2.dest ||
+                !parseSlot(i1.src1, loadSlot) || loadSlot != countdownSlot ||
+                !parseSlot(i3.src2, storeSlot) || storeSlot != condSlot)
+                continue;
+            long long imm = 0;
+            try { imm = std::stoll(i0.src1); } catch (...) { continue; }
+            if (i2.type == IRInstrType::SUB && imm == 1 &&
+                i2.src1 == i1.dest && i2.src2 == i0.dest) {
+                unitDecrement = true; break;
+            }
+            if (i2.type == IRInstrType::ADD && imm == -1 &&
+                ((i2.src1 == i1.dest && i2.src2 == i0.dest) ||
+                 (i2.src2 == i1.dest && i2.src1 == i0.dest))) {
+                unitDecrement = true; break;
+            }
+        }
+        if (!unitDecrement) continue;
+
+        int condStores = 0, countdownStores = 0;
+        for (size_t k = bodyBegin; k < bodyEnd; ++k) {
+            if (func.instrs[k].type != IRInstrType::STORE) continue;
+            int q = -1;
+            if (!parseSlot(func.instrs[k].src2, q)) { safe = false; break; }
+            if (q == condSlot) ++condStores;
+            if (q == countdownSlot) ++countdownStores;
+        }
+        if (!safe || condStores != 1 || countdownStores != 1) continue;
+
+        auto initCountdown = straightLineConstBefore(func, h, countdownSlot);
+        if (!initCountdown || *initCountdown <= 0) continue;
+        const std::uint64_t trips = static_cast<std::uint64_t>(*initCountdown);
+
+        std::unordered_map<std::string, AffineLoopExpr> regs;
+        std::unordered_map<int, AffineLoopExpr> slots;
+        auto reg = [&](const std::string& r) -> AffineLoopExpr {
+            auto it = regs.find(r);
+            if (it == regs.end()) { AffineLoopExpr bad; bad.valid = false; return bad; }
+            return it->second;
+        };
+        auto loadSlot = [&](int slot) -> AffineLoopExpr {
+            auto it = slots.find(slot);
+            if (it != slots.end()) return it->second;
+            if (!modified.count(slot)) {
+                if (auto c = straightLineConstBefore(func, h, slot))
+                    return affineConstant(*c);
+            }
+            return affineIdentity(slot);
+        };
+
+        bool symbolicOK = true;
+        for (size_t k = bodyBegin; k < bodyEnd && symbolicOK; ++k) {
+            const auto& ins = func.instrs[k];
+            switch (ins.type) {
+                case IRInstrType::LI: {
+                    long long v = 0; try { v = std::stoll(ins.src1); }
+                    catch (...) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(v); break;
+                }
+                case IRInstrType::LOAD: {
+                    int q = -1; if (!parseSlot(ins.src1, q)) { symbolicOK = false; break; }
+                    regs[ins.dest] = loadSlot(q); break;
+                }
+                case IRInstrType::STORE: {
+                    int q = -1; if (!parseSlot(ins.src2, q)) { symbolicOK = false; break; }
+                    auto e = reg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    slots[q] = std::move(e); break;
+                }
+                case IRInstrType::MV: {
+                    auto e = reg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::ADD:
+                case IRInstrType::SUB: {
+                    auto e = affineAdd(reg(ins.src1), reg(ins.src2),
+                                       ins.type == IRInstrType::ADD ? 1 : -1);
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::MUL: {
+                    auto a = reg(ins.src1), b = reg(ins.src2);
+                    std::int64_t ca = 0, cb = 0; AffineLoopExpr e;
+                    if (affineIsConstant(a, ca)) e = affineScale(b, ca);
+                    else if (affineIsConstant(b, cb)) e = affineScale(a, cb);
+                    else e.valid = false;
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::DIV:
+                case IRInstrType::REM:
+                case IRInstrType::SLT: {
+                    auto a = reg(ins.src1), b = reg(ins.src2);
+                    std::int64_t ca = 0, cb = 0;
+                    if (!affineIsConstant(a, ca) || !affineIsConstant(b, cb) ||
+                        ca < std::numeric_limits<std::int32_t>::min() ||
+                        ca > std::numeric_limits<std::int32_t>::max() ||
+                        cb < std::numeric_limits<std::int32_t>::min() ||
+                        cb > std::numeric_limits<std::int32_t>::max()) {
+                        symbolicOK = false; break;
+                    }
+                    auto v = foldBinary(ins.type, static_cast<std::int32_t>(ca),
+                                        static_cast<std::int32_t>(cb));
+                    if (!v) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(*v); break;
+                }
+                case IRInstrType::SEQZ:
+                case IRInstrType::SNEZ: {
+                    auto a = reg(ins.src1); std::int64_t c = 0;
+                    if (!affineIsConstant(a, c)) { symbolicOK = false; break; }
+                    regs[ins.dest] = affineConstant(
+                        ins.type == IRInstrType::SEQZ ? (c == 0 ? 1 : 0)
+                                                     : (c != 0 ? 1 : 0));
+                    break;
+                }
+                default: symbolicOK = false; break;
+            }
+        }
+        if (!symbolicOK) continue;
+
+        std::unordered_set<int> stateSet;
+        for (int q : modified)
+            if (slotLoadedAfter(func, back + 1, q)) stateSet.insert(q);
+        if (stateSet.empty()) continue;
+
+        bool depsOK = true, grew = true;
+        while (grew && depsOK) {
+            grew = false;
+            std::vector<int> cur(stateSet.begin(), stateSet.end());
+            for (int q : cur) {
+                AffineLoopExpr e = slots.count(q) ? slots[q] : affineIdentity(q);
+                if (!e.valid) { depsOK = false; break; }
+                for (const auto& [dep, coeff] : e.coeff) {
+                    if (coeff == 0 || stateSet.count(dep)) continue;
+                    if (modified.count(dep)) { stateSet.insert(dep); grew = true; }
+                    else { depsOK = false; break; }
+                }
+                if (!depsOK) break;
+            }
+        }
+        if (!depsOK || stateSet.empty() || stateSet.size() > 16) continue;
+
+        std::vector<int> state(stateSet.begin(), stateSet.end());
+        std::sort(state.begin(), state.end());
+        std::unordered_map<int, size_t> pos;
+        for (size_t i = 0; i < state.size(); ++i) pos[state[i]] = i;
+        const size_t D = state.size() + 1;
+
+        std::vector<std::uint32_t> M(D * D, 0);
+        bool matrixOK = true;
+        std::vector<char> initialNeeded(state.size(), 0);
+        for (size_t r = 0; r < state.size(); ++r) {
+            AffineLoopExpr e = slots.count(state[r]) ? slots[state[r]]
+                                                     : affineIdentity(state[r]);
+            if (!e.valid) { matrixOK = false; break; }
+            for (const auto& [dep, coeff] : e.coeff) {
+                auto it = pos.find(dep);
+                if (it == pos.end()) { matrixOK = false; break; }
+                M[r * D + it->second] += static_cast<std::uint32_t>(coeff);
+                if (coeff != 0) initialNeeded[it->second] = 1;
+            }
+            if (!matrixOK) break;
+            M[r * D + (D - 1)] += static_cast<std::uint32_t>(e.constant);
+        }
+        if (!matrixOK) continue;
+        M[(D - 1) * D + (D - 1)] = 1;
+
+        std::vector<std::uint32_t> initVec(D, 0);
+        bool initOK = true;
+        for (size_t i = 0; i < state.size(); ++i) {
+            if (!initialNeeded[i]) continue;
+            auto c = straightLineConstBefore(func, h, state[i]);
+            if (!c) { initOK = false; break; }
+            initVec[i] = static_cast<std::uint32_t>(*c);
+        }
+        if (!initOK) continue;
+        initVec[D - 1] = 1;
+
+        auto mulMat = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& B) {
+            std::vector<std::uint32_t> C(D * D, 0);
+            for (size_t i = 0; i < D; ++i)
+                for (size_t k = 0; k < D; ++k) {
+                    const std::uint32_t aik = A[i * D + k];
+                    if (aik == 0) continue;
+                    for (size_t j = 0; j < D; ++j)
+                        C[i * D + j] += static_cast<std::uint32_t>(
+                            static_cast<std::uint64_t>(aik) * B[k * D + j]);
+                }
+            return C;
+        };
+        auto mulVec = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& x) {
+            std::vector<std::uint32_t> y(D, 0);
+            for (size_t i = 0; i < D; ++i)
+                for (size_t j = 0; j < D; ++j)
+                    y[i] += static_cast<std::uint32_t>(
+                        static_cast<std::uint64_t>(A[i * D + j]) * x[j]);
+            return y;
+        };
+
+        std::vector<std::uint32_t> P(D * D, 0), B = M;
+        for (size_t i = 0; i < D; ++i) P[i * D + i] = 1;
+        std::uint64_t eN = trips;
+        while (eN) {
+            if (eN & 1ULL) P = mulMat(P, B);
+            eN >>= 1ULL;
+            if (eN) B = mulMat(B, B);
+        }
+        const auto finalVec = mulVec(P, initVec);
+
+        std::vector<IRInstr> out;
+        out.reserve(n - (back - h + 1) + state.size() * 2);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+        for (size_t i = 0; i < state.size(); ++i) {
+            if (!slotLoadedAfter(func, back + 1, state[i])) continue;
+            const std::int32_t v = static_cast<std::int32_t>(finalVec[i]);
+            out.emplace_back(IRInstrType::LI, "t0", std::to_string(v));
+            out.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(state[i]));
+        }
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
+
+// The generic tail-recursion unroller above deliberately keys off the
+// compiler-generated `.tail_latch_` label.  After a tail-recursive helper is
+// inlined into its caller, scalar cleanup can remove that label and leave the
+// equivalent compact bottom-tested form.  Recognize only that very narrow
+// inlined shape and add a 16-iteration fast path with the original scalar loop
+// retained as an exact remainder.  No function is executed at compile time.
+bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 12) return false;
+    static std::uint64_t serial = 0;
+
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL)
+            labels[func.instrs[i].label] = i;
+
+    for (size_t back = n; back-- > 0;) {
+        const auto& br = func.instrs[back];
+        if (br.type != IRInstrType::BRANCH_ZERO &&
+            br.type != IRInstrType::BRANCH_NONZERO)
+            continue;
+        auto hit = labels.find(br.label);
+        if (hit == labels.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+        const std::string header = br.label;
+
+        // This matcher exists solely for a tail-recursive helper after inlining.
+        // Ordinary source while-loops do not receive an `.inl` suffix.
+        if (header.find(".inl") == std::string::npos) continue;
+        if (back < h + 5 || back < 2) continue;
+
+        const auto& condLoad = func.instrs[back - 2];
+        const auto& condNorm = func.instrs[back - 1];
+        const bool continueOnNonzero =
+            (condNorm.type == IRInstrType::SEQZ &&
+             br.type == IRInstrType::BRANCH_ZERO) ||
+            (condNorm.type == IRInstrType::SNEZ &&
+             br.type == IRInstrType::BRANCH_NONZERO);
+        if (!continueOnNonzero ||
+            condLoad.type != IRInstrType::LOAD ||
+            condNorm.dest != condLoad.dest ||
+            condNorm.src1 != condLoad.dest ||
+            br.src1 != condNorm.dest)
+            continue;
+
+        int condSlot = -1;
+        if (!parseSlot(condLoad.src1, condSlot)) continue;
+        const size_t bodyBegin = h + 1;
+        const size_t bodyEnd = back - 2; // exclude LOAD/SEQZ-or-SNEZ/branch
+        if (bodyBegin >= bodyEnd) continue;
+
+        bool straightLine = true;
+        for (size_t k = bodyBegin; k < bodyEnd; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::LABEL || t == IRInstrType::JUMP ||
+                t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO ||
+                t == IRInstrType::CALL || t == IRInstrType::LOAD_GLOBAL ||
+                t == IRInstrType::STORE_GLOBAL || t == IRInstrType::LOAD_ARG ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET) {
+                straightLine = false; break;
+            }
+        }
+        if (!straightLine) continue;
+
+        // Recover the carried countdown slot from the compiler-generated copy
+        // `LOAD condSlot; STORE countdownSlot`.
+        int countdownSlot = -1;
+        size_t countdownCopy = n;
+        for (size_t k = bodyBegin; k + 1 < bodyEnd; ++k) {
+            const auto& a = func.instrs[k];
+            const auto& b = func.instrs[k + 1];
+            int src = -1, dst = -1;
+            if (a.type == IRInstrType::LOAD &&
+                b.type == IRInstrType::STORE && b.src1 == a.dest &&
+                parseSlot(a.src1, src) && src == condSlot &&
+                parseSlot(b.src2, dst) && dst != condSlot) {
+                if (countdownSlot != -1 && countdownSlot != dst) {
+                    countdownSlot = -2; break;
+                }
+                countdownSlot = dst;
+                countdownCopy = k;
+            }
+        }
+        if (countdownSlot < 0 || countdownCopy == n) continue;
+
+        // Prove the exact unit-decrement producer of condSlot:
+        //   LI 1; LOAD countdown; SUB; STORE condSlot
+        // The ADD -1 spelling is accepted too.
+        bool unitDecrement = false;
+        for (size_t k = bodyBegin; k + 3 < bodyEnd; ++k) {
+            const auto& i0 = func.instrs[k];
+            const auto& i1 = func.instrs[k + 1];
+            const auto& i2 = func.instrs[k + 2];
+            const auto& i3 = func.instrs[k + 3];
+            int loadSlot = -1, storeSlot = -1;
+            if (i0.type != IRInstrType::LI ||
+                i1.type != IRInstrType::LOAD ||
+                i3.type != IRInstrType::STORE || i3.src1 != i2.dest ||
+                !parseSlot(i1.src1, loadSlot) || loadSlot != countdownSlot ||
+                !parseSlot(i3.src2, storeSlot) || storeSlot != condSlot)
+                continue;
+
+            long long imm = 0;
+            try { imm = std::stoll(i0.src1); } catch (...) { continue; }
+            if (i2.type == IRInstrType::SUB && imm == 1 &&
+                i2.src1 == i1.dest && i2.src2 == i0.dest) {
+                unitDecrement = true; break;
+            }
+            if (i2.type == IRInstrType::ADD && imm == -1 &&
+                ((i2.src1 == i1.dest && i2.src2 == i0.dest) ||
+                 (i2.src2 == i1.dest && i2.src1 == i0.dest))) {
+                unitDecrement = true; break;
+            }
+        }
+        if (!unitDecrement) continue;
+
+        // The condition temporary and the carried countdown must each have the
+        // unique stores proven above; otherwise a duplicated 16-trip body could
+        // skip an alternate update path.
+        int condStores = 0, countdownStores = 0;
+        for (size_t k = bodyBegin; k < bodyEnd; ++k) {
+            if (func.instrs[k].type != IRInstrType::STORE) continue;
+            int q = -1;
+            if (!parseSlot(func.instrs[k].src2, q)) { straightLine = false; break; }
+            if (q == condSlot) ++condStores;
+            if (q == countdownSlot) ++countdownStores;
+        }
+        if (!straightLine || condStores != 1 || countdownStores != 1) continue;
+
+        // Only transform when the entry countdown is proven positive and large
+        // enough that the fast path is useful.  The generated runtime guard still
+        // preserves the exact scalar remainder.
+        auto init = straightLineConstBefore(func, h, countdownSlot);
+        constexpr int F = 16;
+        if (!init || *init < F) continue;
+
+        const std::string fastGuard = ".tail_inl_u16_guard_" + func.name + "_" +
+                                      std::to_string(serial);
+        const std::string fastBody = ".tail_inl_u16_body_" + func.name + "_" +
+                                     std::to_string(serial);
+        const std::string tail = ".tail_inl_u16_tail_" + func.name + "_" +
+                                 std::to_string(serial);
+        const std::string done = ".tail_inl_u16_done_" + func.name + "_" +
+                                 std::to_string(serial++);
+
+        std::vector<IRInstr> out;
+        out.reserve(n + (bodyEnd - bodyBegin) * (F - 1) + 16);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", fastGuard);
+        out.emplace_back(IRInstrType::LI, "t0", std::to_string(F));
+        out.emplace_back(IRInstrType::LOAD, "t1", std::to_string(countdownSlot));
+        out.emplace_back(IRInstrType::SLT, "t0", "t1", "t0");
+        out.emplace_back(IRInstrType::BRANCH_NONZERO, "", "t0", "", tail);
+        out.emplace_back(IRInstrType::LABEL, "", "", "", fastBody);
+
+        for (int copy = 0; copy < F; ++copy)
+            out.insert(out.end(),
+                       func.instrs.begin() + static_cast<long>(bodyBegin),
+                       func.instrs.begin() + static_cast<long>(bodyEnd));
+        out.emplace_back(IRInstrType::JUMP, "", "", "", fastGuard);
+
+        out.emplace_back(IRInstrType::LABEL, "", "", "", tail);
+        out.emplace_back(IRInstrType::LOAD, "t0", std::to_string(countdownSlot));
+        out.emplace_back(IRInstrType::BRANCH_ZERO, "", "t0", "", done);
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(h),
+                   func.instrs.begin() + static_cast<long>(back + 1));
+        out.emplace_back(IRInstrType::LABEL, "", "", "", done);
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
+
 void optimizeFunctionCommon(IRFunction& func) {
     // Canonical scalar cleanup. Keep loops recognizable while performing
     // propagation, CSE, DCE and tail-recursion elimination; loop-specific
     // transformations are applied in the code-generation stage.
     eliminateDirectTailRecursion(func);
-    for (int round = 0; round < 4; ++round) {
+    for (int round = 0; round < 12; ++round) {
         bool changed = false;
         changed |= propagateConstantsAcrossCFG(func);
         changed |= propagateCopiesAcrossCFG(func);
@@ -3382,6 +4336,7 @@ void optimizeFunctionCommon(IRFunction& func) {
         changed |= removeRedundantDirectReturnCopies(func);
         changed |= removeRedundantSelfCopies(func);
         changed |= removeJumpToNextLabel(func);
+        changed |= removeUnreferencedLabels(func);
         if (!changed) break;
     }
 
@@ -3402,10 +4357,35 @@ void optimizeFunctionCommon(IRFunction& func) {
 bool rotateCanonicalWhileLoops(IRFunction& func);
 
 void optimizeFunctionForCodegen(IRFunction& func) {
-    // First collapse provably affine counted loops to closed-form updates.
-    // This is intentionally local recurrence analysis over a proven
-    // canonical loop and is especially profitable after scalar
-    // propagation/CSE/DCE have simplified the basic performance benchmarks.
+    // Tail-recursion elimination creates a bottom-tested countdown loop.
+    // Prefer an exact affine recurrence summary; if the body is not affine,
+    // fall back to a bounded 16x fast path plus the exact scalar remainder.
+    summarizeInlinedUnitCountdownLoop(func);
+    unrollInlinedUnitCountdownLoop(func);
+    unrollTailCountdownLoop(func);
+
+    // First collapse side-effect-free counted loops whose local carried
+    // state forms a small affine transition.  This catches longer copy/CSE/
+    // algebra chains that are not limited to a single accumulator recurrence.
+    for (int linearRound = 0; linearRound < 8; ++linearRound) {
+        if (!summarizeLinearStateCountedLoop(func)) break;
+        for (int round = 0; round < 8; ++round) {
+            bool changed = false;
+            changed |= propagateConstantsAcrossCFG(func);
+            changed |= propagateCopiesAcrossCFG(func);
+            changed |= simplifyLocally(func);
+            changed |= removeUnreachableAfterJump(func);
+            changed |= eliminateUnreachableCFG(func);
+            changed |= eliminateDeadStores(func);
+            changed |= eliminateDeadRegisterComputations(func);
+            changed |= removeRedundantSelfCopies(func);
+            changed |= removeJumpToNextLabel(func);
+            changed |= removeUnreferencedLabels(func);
+            if (!changed) break;
+        }
+    }
+
+    // Then handle the narrower accumulator-style affine recurrence.
     for (int loopRound = 0; loopRound < 8; ++loopRound) {
         if (!summarizeAffineCountedLoop(func)) break;
         for (int round = 0; round < 3; ++round) {
@@ -3505,7 +4485,7 @@ void optimizeFunctionForCodegen(IRFunction& func) {
     // Loop transforms often expose fresh copy/dead-store opportunities.  A
     // short cleanup fixed point keeps the final IR compact without reapplying
     // code-growth transforms.
-    for (int round = 0; round < 3; ++round) {
+    for (int round = 0; round < 8; ++round) {
         bool changed = false;
         changed |= propagateConstantsAcrossCFG(func);
         changed |= propagateCopiesAcrossCFG(func);
@@ -3739,7 +4719,21 @@ bool inlineSmallLeafFunctions(IRProgram& program) {
             auto it=candidates.find(ins.src1);
             if (it==candidates.end()) { out.push_back(ins); continue; }
             const IRFunction& callee=*it->second;
-            const bool ordinarySmall = callee.instrs.size()<=48 && callee.localSize<=192;
+            bool generatedTailLoop = false;
+            for (const auto& ci : callee.instrs) {
+                if (ci.type == IRInstrType::LABEL &&
+                    (ci.label.rfind(".tail_", 0) == 0 ||
+                     ci.label.find(".tail_latch_") != std::string::npos)) {
+                    generatedTailLoop = true; break;
+                }
+            }
+            const bool ordinarySmall =
+                (callee.instrs.size()<=48 && callee.localSize<=192) ||
+                // Tail-recursion elimination has already turned recursion into
+                // a bounded local loop.  Inline moderately larger generated
+                // tail loops even at a cold call-site so later recurrence
+                // analysis can see constant arguments from the caller.
+                (generatedTailLoop && callee.instrs.size()<=160 && callee.localSize<=640);
             const bool hotSite = callPos<hot.size() && hot[callPos];
             if (!ordinarySmall && !hotSite) { out.push_back(ins); continue; }
             // Keep inlining profitable and bounded.  Hot loop helpers may be

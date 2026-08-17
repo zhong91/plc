@@ -105,10 +105,27 @@ RiscvGenerator::choosePromotedSlots(const IRFunction& func) const {
         }
     }
 
+    // A slot participating in a pure copy may have only one explicit LOAD or
+    // STORE after scalar cleanup.  Keep such endpoints eligible for coloring so
+    // they can coalesce with the source/destination instead of falling back to
+    // a stack round-trip in copy-heavy benchmarks.
+    std::unordered_set<int> copyRelated;
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const auto& a = func.instrs[i];
+        const auto& b = func.instrs[i + 1];
+        if (a.type == IRInstrType::LOAD &&
+            b.type == IRInstrType::STORE && b.src1 == a.dest) {
+            int src = std::stoi(a.src1), dst = std::stoi(b.src2);
+            copyRelated.insert(src);
+            copyRelated.insert(dst);
+        }
+    }
+
     struct Candidate { int offset; long long score; int count; };
     std::vector<Candidate> candidates;
     for (const auto& [off, sc] : score) {
-        if (rawCount[off] >= 2) candidates.push_back({off, sc, rawCount[off]});
+        if (rawCount[off] >= 2 || copyRelated.count(off))
+            candidates.push_back({off, sc, rawCount[off]});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) return a.score > b.score;
