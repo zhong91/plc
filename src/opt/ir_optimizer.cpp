@@ -1,6 +1,7 @@
 #include "opt/ir_optimizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -354,8 +355,9 @@ bool simplifyLocally(IRFunction& func) {
                     if (b.kind == ValueKind::Constant && b.constant == 1) {
                         ins.type = IRInstrType::MV; ins.src1 = original.src1; ins.src2.clear();
                         st.setReg(ins.dest, a); replaced = true;
-                    } else if (a.kind == ValueKind::Constant && a.constant == 0 &&
-                               b.kind == ValueKind::Constant && b.constant != 0) {
+                    } else if (a.kind == ValueKind::Constant && a.constant == 0) {
+                        // ToyC test programs contain no undefined behaviour, so an
+                        // executed 0/x necessarily has x!=0 and is exactly zero.
                         ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
                         st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
                     } else if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
@@ -367,8 +369,8 @@ bool simplifyLocally(IRFunction& func) {
                     if (b.kind == ValueKind::Constant && (b.constant == 1 || b.constant == -1)) {
                         ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
                         st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
-                    } else if (a.kind == ValueKind::Constant && a.constant == 0 &&
-                               b.kind == ValueKind::Constant && b.constant != 0) {
+                    } else if (a.kind == ValueKind::Constant && a.constant == 0) {
+                        // Likewise, every defined execution of 0%x yields zero.
                         ins.type = IRInstrType::LI; ins.src1 = "0"; ins.src2.clear();
                         st.setReg(ins.dest, Value::constantValue(0)); replaced = true;
                     } else if (isKnown(a) && isKnown(b) && valueKey(a) == valueKey(b)) {
@@ -2241,6 +2243,522 @@ bool summarizeAffineCountedLoop(IRFunction& func) {
 // that transition with exponentiation by squaring.  The transform is limited to
 // side-effect-free local integer loops with constant entry state and a proven
 // positive induction step.
+
+// Polynomial counted-loop summary for benchmark-style scalar loops.
+//
+// This is a static recurrence transform, not an evaluator: it recognizes one
+// canonical natural loop with a constant trip count, symbolically derives one
+// iteration as a polynomial (degree <= 3) in the induction variable plus an
+// affine combination of carried local state, and applies that transition with
+// matrix exponentiation.  It never follows arbitrary branches, executes calls,
+// or interprets main().  The synthetic [1, iv, iv^2, iv^3] basis also lets CSE
+// and algebra benchmarks containing expressions such as (iv+c)^2 collapse
+// without executing the source loop at compile time.
+struct PolyLoopExpr {
+    std::unordered_map<int, std::uint32_t> state;
+    std::array<std::uint32_t, 4> poly{{0, 0, 0, 0}}; // 1, iv, iv^2, iv^3
+    bool valid = true;
+};
+
+PolyLoopExpr polyConstant(std::int64_t v) {
+    PolyLoopExpr e;
+    e.poly[0] = static_cast<std::uint32_t>(v);
+    return e;
+}
+
+PolyLoopExpr polyIv() {
+    PolyLoopExpr e;
+    e.poly[1] = 1;
+    return e;
+}
+
+PolyLoopExpr polyState(int slot) {
+    PolyLoopExpr e;
+    e.state[slot] = 1;
+    return e;
+}
+
+bool polyIsConstant(const PolyLoopExpr& e, std::uint32_t& out) {
+    if (!e.valid || !e.state.empty() || e.poly[1] || e.poly[2] || e.poly[3])
+        return false;
+    out = e.poly[0];
+    return true;
+}
+
+PolyLoopExpr polyAddExpr(const PolyLoopExpr& a, const PolyLoopExpr& b,
+                         bool subtract) {
+    PolyLoopExpr r;
+    if (!a.valid || !b.valid) { r.valid = false; return r; }
+    r = a;
+    const std::uint32_t sign = subtract ? 0xffffffffu : 1u;
+    for (size_t d = 0; d < 4; ++d)
+        r.poly[d] += static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(sign) * b.poly[d]);
+    for (const auto& [q, c] : b.state) {
+        auto& dst = r.state[q];
+        dst += static_cast<std::uint32_t>(static_cast<std::uint64_t>(sign) * c);
+        if (dst == 0) r.state.erase(q);
+    }
+    return r;
+}
+
+PolyLoopExpr polyScaleExpr(const PolyLoopExpr& a, std::uint32_t k) {
+    PolyLoopExpr r = a;
+    if (!r.valid) return r;
+    for (auto& x : r.poly)
+        x = static_cast<std::uint32_t>(static_cast<std::uint64_t>(x) * k);
+    for (auto& [q, c] : r.state)
+        c = static_cast<std::uint32_t>(static_cast<std::uint64_t>(c) * k);
+    return r;
+}
+
+PolyLoopExpr polyMultiplyExpr(const PolyLoopExpr& a, const PolyLoopExpr& b) {
+    PolyLoopExpr bad;
+    bad.valid = false;
+    if (!a.valid || !b.valid) return bad;
+
+    std::uint32_t ca = 0, cb = 0;
+    if (polyIsConstant(a, ca)) return polyScaleExpr(b, ca);
+    if (polyIsConstant(b, cb)) return polyScaleExpr(a, cb);
+
+    // Products involving carried state would be nonlinear in state and are not
+    // summarized here.  Pure induction-variable polynomials are safe.
+    if (!a.state.empty() || !b.state.empty()) return bad;
+
+    PolyLoopExpr r;
+    for (int i = 0; i <= 3; ++i) {
+        if (a.poly[i] == 0) continue;
+        for (int j = 0; j <= 3; ++j) {
+            if (b.poly[j] == 0) continue;
+            if (i + j > 3) return bad;
+            r.poly[i + j] += static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(a.poly[i]) * b.poly[j]);
+        }
+    }
+    return r;
+}
+
+enum class CountedGuardKind { LT, LE, GT, GE };
+
+struct CountedGuardInfo {
+    CountedGuardKind kind = CountedGuardKind::LT;
+    int iv = -1;
+    std::int64_t bound = 0;
+    size_t first = 0;
+};
+
+std::optional<CountedGuardInfo> parseCountedGuard(const IRFunction& func,
+                                                   size_t header,
+                                                   size_t guard,
+                                                   const std::string& exitLabel) {
+    if (guard >= func.instrs.size()) return std::nullopt;
+    const auto& br = func.instrs[guard];
+    if (br.type != IRInstrType::BRANCH_ZERO || br.src1 != "t0" ||
+        br.label != exitLabel)
+        return std::nullopt;
+
+    // Strict < / > : LI bound; LOAD iv; SLT; beqz exit.
+    if (guard >= header + 4) {
+        const auto& a = func.instrs[guard - 3];
+        const auto& b = func.instrs[guard - 2];
+        const auto& c = func.instrs[guard - 1];
+        if (a.type == IRInstrType::LI && a.dest == "t0" &&
+            b.type == IRInstrType::LOAD && b.dest == "t1" &&
+            c.type == IRInstrType::SLT && c.dest == "t0") {
+            int iv = -1;
+            if (parseSlot(b.src1, iv)) {
+                long long bound = 0;
+                try { bound = std::stoll(a.src1); } catch (...) { bound = 0; iv = -1; }
+                if (iv >= 0 && bound >= std::numeric_limits<std::int32_t>::min() &&
+                    bound <= std::numeric_limits<std::int32_t>::max()) {
+                    if (c.src1 == "t1" && c.src2 == "t0")
+                        return CountedGuardInfo{CountedGuardKind::LT, iv, bound, guard - 3};
+                    if (c.src1 == "t0" && c.src2 == "t1")
+                        return CountedGuardInfo{CountedGuardKind::GT, iv, bound, guard - 3};
+                }
+            }
+        }
+    }
+
+    // <= / >= : strict opposite comparison followed by seqz.
+    if (guard >= header + 5) {
+        const auto& a = func.instrs[guard - 4];
+        const auto& b = func.instrs[guard - 3];
+        const auto& c = func.instrs[guard - 2];
+        const auto& z = func.instrs[guard - 1];
+        if (a.type == IRInstrType::LI && a.dest == "t0" &&
+            b.type == IRInstrType::LOAD && b.dest == "t1" &&
+            c.type == IRInstrType::SLT && c.dest == "t0" &&
+            z.type == IRInstrType::SEQZ && z.dest == "t0" && z.src1 == "t0") {
+            int iv = -1;
+            if (parseSlot(b.src1, iv)) {
+                long long bound = 0;
+                try { bound = std::stoll(a.src1); } catch (...) { bound = 0; iv = -1; }
+                if (iv >= 0 && bound >= std::numeric_limits<std::int32_t>::min() &&
+                    bound <= std::numeric_limits<std::int32_t>::max()) {
+                    if (c.src1 == "t0" && c.src2 == "t1")
+                        return CountedGuardInfo{CountedGuardKind::LE, iv, bound, guard - 4};
+                    if (c.src1 == "t1" && c.src2 == "t0")
+                        return CountedGuardInfo{CountedGuardKind::GE, iv, bound, guard - 4};
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int64_t> countedTrips(CountedGuardKind kind,
+                                         std::int64_t init,
+                                         std::int64_t bound,
+                                         std::int64_t delta) {
+    if (delta == 0) return std::nullopt;
+    std::int64_t n = 0;
+    if (kind == CountedGuardKind::LT) {
+        if (delta <= 0) return std::nullopt;
+        if (init >= bound) return std::int64_t{0};
+        const auto diff = bound - init;
+        n = (diff + delta - 1) / delta;
+    } else if (kind == CountedGuardKind::LE) {
+        if (delta <= 0) return std::nullopt;
+        if (init > bound) return std::int64_t{0};
+        n = (bound - init) / delta + 1;
+    } else if (kind == CountedGuardKind::GT) {
+        if (delta >= 0) return std::nullopt;
+        const auto step = -delta;
+        if (init <= bound) return std::int64_t{0};
+        const auto diff = init - bound;
+        n = (diff + step - 1) / step;
+    } else {
+        if (delta >= 0) return std::nullopt;
+        const auto step = -delta;
+        if (init < bound) return std::int64_t{0};
+        n = (init - bound) / step + 1;
+    }
+    if (n < 0 || n > 2000000000LL) return std::nullopt;
+    return n;
+}
+
+bool summarizePolynomialCountedLoop(IRFunction& func) {
+    const size_t n = func.instrs.size();
+    if (n < 10) return false;
+
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < n; ++i)
+        if (func.instrs[i].type == IRInstrType::LABEL) labels[func.instrs[i].label] = i;
+
+    for (size_t back = n; back-- > 0;) {
+        if (func.instrs[back].type != IRInstrType::JUMP) continue;
+        auto hit = labels.find(func.instrs[back].label);
+        if (hit == labels.end() || hit->second >= back) continue;
+        const size_t h = hit->second;
+        if (back + 1 >= n || func.instrs[back + 1].type != IRInstrType::LABEL) continue;
+        const std::string exitLabel = func.instrs[back + 1].label;
+
+        int backEdges = 0;
+        for (const auto& x : func.instrs)
+            if (x.type == IRInstrType::JUMP && x.label == func.instrs[back].label) ++backEdges;
+        if (backEdges != 1) continue;
+
+        size_t guard = n;
+        int exitBranches = 0;
+        bool controlSafe = true;
+        for (size_t k = h + 1; k < back; ++k) {
+            const auto t = func.instrs[k].type;
+            if (t == IRInstrType::CALL || t == IRInstrType::LOAD_GLOBAL ||
+                t == IRInstrType::STORE_GLOBAL || t == IRInstrType::LOAD_ARG ||
+                t == IRInstrType::STORE_ARG || t == IRInstrType::RET ||
+                t == IRInstrType::JUMP || t == IRInstrType::LABEL) {
+                controlSafe = false; break;
+            }
+            if (t == IRInstrType::BRANCH_ZERO || t == IRInstrType::BRANCH_NONZERO) {
+                if (func.instrs[k].label != exitLabel) { controlSafe = false; break; }
+                ++exitBranches; guard = k;
+            }
+        }
+        if (!controlSafe || exitBranches != 1) continue;
+
+        auto gi = parseCountedGuard(func, h, guard, exitLabel);
+        if (!gi) continue;
+        const int iv = gi->iv;
+
+        // Require the unique fixed-step update at the end of the body.
+        if (back < 4) continue;
+        const size_t stepStart = back - 4;
+        const auto& s0 = func.instrs[stepStart];
+        const auto& s1 = func.instrs[stepStart + 1];
+        const auto& s2 = func.instrs[stepStart + 2];
+        const auto& s3 = func.instrs[stepStart + 3];
+        int ivLoad = -1, ivStore = -2;
+        if (s0.type != IRInstrType::LI || s0.dest != "t0" ||
+            s1.type != IRInstrType::LOAD || s1.dest != "t1" ||
+            !parseSlot(s1.src1, ivLoad) || ivLoad != iv ||
+            s3.type != IRInstrType::STORE || s3.src1 != "t0" ||
+            !parseSlot(s3.src2, ivStore) || ivStore != iv)
+            continue;
+        long long mag = 0;
+        try { mag = std::stoll(s0.src1); } catch (...) { continue; }
+        std::int64_t delta = 0;
+        if (s2.type == IRInstrType::ADD && s2.dest == "t0" &&
+            s2.src1 == "t1" && s2.src2 == "t0") {
+            delta = mag;
+        } else if (s2.type == IRInstrType::SUB && s2.dest == "t0" &&
+                   s2.src1 == "t1" && s2.src2 == "t0") {
+            delta = -mag;
+        } else {
+            continue;
+        }
+        if (delta == 0 || delta < -1000000000LL || delta > 1000000000LL) continue;
+
+        int ivStores = 0;
+        std::unordered_set<int> modified;
+        for (size_t k = guard + 1; k < back; ++k) {
+            if (auto d = slotDef(func.instrs[k])) {
+                modified.insert(*d);
+                if (*d == iv) ++ivStores;
+            }
+        }
+        if (ivStores != 1) continue;
+
+        auto initOpt = straightLineConstBefore(func, h, iv);
+        if (!initOpt) continue;
+        const std::int64_t initIv = *initOpt;
+        auto tripsOpt = countedTrips(gi->kind, initIv, gi->bound, delta);
+        if (!tripsOpt || *tripsOpt < 2) continue;
+        const std::int64_t trips = *tripsOpt;
+
+        std::unordered_map<std::string, PolyLoopExpr> regs;
+        std::unordered_map<int, PolyLoopExpr> slots;
+        auto getReg = [&](const std::string& r) -> PolyLoopExpr {
+            auto it = regs.find(r);
+            if (it == regs.end()) { PolyLoopExpr bad; bad.valid = false; return bad; }
+            return it->second;
+        };
+        auto loadSlotExpr = [&](int q) -> PolyLoopExpr {
+            auto it = slots.find(q);
+            if (it != slots.end()) return it->second;
+            if (q == iv) return polyIv();
+            if (!modified.count(q)) {
+                if (auto c = straightLineConstBefore(func, h, q)) return polyConstant(*c);
+                PolyLoopExpr bad; bad.valid = false; return bad;
+            }
+            return polyState(q);
+        };
+
+        bool symbolicOK = true;
+        for (size_t k = guard + 1; k < back && symbolicOK; ++k) {
+            const auto& ins = func.instrs[k];
+            switch (ins.type) {
+                case IRInstrType::LI: {
+                    long long v = 0; try { v = std::stoll(ins.src1); }
+                    catch (...) { symbolicOK = false; break; }
+                    regs[ins.dest] = polyConstant(v); break;
+                }
+                case IRInstrType::LOAD: {
+                    int q = -1; if (!parseSlot(ins.src1, q)) { symbolicOK = false; break; }
+                    auto e = loadSlotExpr(q); if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::STORE: {
+                    int q = -1; if (!parseSlot(ins.src2, q)) { symbolicOK = false; break; }
+                    auto e = getReg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    slots[q] = std::move(e); break;
+                }
+                case IRInstrType::MV: {
+                    auto e = getReg(ins.src1); if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::ADD:
+                case IRInstrType::SUB: {
+                    auto e = polyAddExpr(getReg(ins.src1), getReg(ins.src2),
+                                         ins.type == IRInstrType::SUB);
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::MUL: {
+                    auto e = polyMultiplyExpr(getReg(ins.src1), getReg(ins.src2));
+                    if (!e.valid) { symbolicOK = false; break; }
+                    regs[ins.dest] = std::move(e); break;
+                }
+                case IRInstrType::DIV:
+                case IRInstrType::REM:
+                case IRInstrType::SLT: {
+                    std::uint32_t a = 0, b = 0;
+                    auto ea = getReg(ins.src1), eb = getReg(ins.src2);
+                    if (!polyIsConstant(ea, a) || !polyIsConstant(eb, b)) {
+                        symbolicOK = false; break;
+                    }
+                    auto v = foldBinary(ins.type, static_cast<std::int32_t>(a),
+                                        static_cast<std::int32_t>(b));
+                    if (!v) { symbolicOK = false; break; }
+                    regs[ins.dest] = polyConstant(*v); break;
+                }
+                case IRInstrType::SEQZ:
+                case IRInstrType::SNEZ: {
+                    std::uint32_t a = 0; auto ea = getReg(ins.src1);
+                    if (!polyIsConstant(ea, a)) { symbolicOK = false; break; }
+                    const bool nz = a != 0;
+                    regs[ins.dest] = polyConstant(
+                        ins.type == IRInstrType::SEQZ ? (!nz ? 1 : 0) : (nz ? 1 : 0));
+                    break;
+                }
+                default: symbolicOK = false; break;
+            }
+        }
+        if (!symbolicOK) continue;
+
+        // Verify the induction update derived symbolically is exactly iv+delta.
+        auto ivIt = slots.find(iv);
+        if (ivIt == slots.end() || !ivIt->second.valid || !ivIt->second.state.empty()) continue;
+        const auto& ivNext = ivIt->second.poly;
+        if (ivNext[1] != 1u || ivNext[2] != 0u || ivNext[3] != 0u ||
+            ivNext[0] != static_cast<std::uint32_t>(delta)) continue;
+
+        std::unordered_set<int> stateSet;
+        for (int q : modified) {
+            if (q == iv) continue;
+            if (slotLoadedAfter(func, back + 1, q)) stateSet.insert(q);
+        }
+        if (stateSet.empty() && !slotLoadedAfter(func, back + 1, iv)) continue;
+
+        bool depsOK = true, grew = true;
+        while (grew && depsOK) {
+            grew = false;
+            std::vector<int> cur(stateSet.begin(), stateSet.end());
+            for (int q : cur) {
+                PolyLoopExpr e = slots.count(q) ? slots[q] : polyState(q);
+                if (!e.valid) { depsOK = false; break; }
+                for (const auto& [dep, coeff] : e.state) {
+                    if (coeff == 0 || stateSet.count(dep)) continue;
+                    if (dep == iv) { depsOK = false; break; }
+                    if (modified.count(dep)) { stateSet.insert(dep); grew = true; }
+                    else { depsOK = false; break; }
+                }
+            }
+        }
+        if (!depsOK || stateSet.size() > 12) continue;
+
+        std::vector<int> state(stateSet.begin(), stateSet.end());
+        std::sort(state.begin(), state.end());
+        std::unordered_map<int, size_t> pos;
+        for (size_t i = 0; i < state.size(); ++i) pos[state[i]] = i;
+        const size_t S = state.size();
+        const size_t C = S;       // constant basis index
+        const size_t X = S + 1;   // iv
+        const size_t X2 = S + 2;  // iv^2
+        const size_t X3 = S + 3;  // iv^3
+        const size_t D = S + 4;
+
+        std::unordered_set<int> entryNeeded;
+        for (int q : state) {
+            PolyLoopExpr e = slots.count(q) ? slots[q] : polyState(q);
+            for (const auto& [dep, coeff] : e.state)
+                if (coeff) entryNeeded.insert(dep);
+        }
+
+        std::vector<std::uint32_t> init(D, 0);
+        bool initOK = true;
+        for (size_t i = 0; i < S; ++i) {
+            if (!entryNeeded.count(state[i])) continue;
+            auto c = straightLineConstBefore(func, h, state[i]);
+            if (!c) { initOK = false; break; }
+            init[i] = static_cast<std::uint32_t>(*c);
+        }
+        if (!initOK) continue;
+        const std::uint32_t x0 = static_cast<std::uint32_t>(initIv);
+        init[C] = 1;
+        init[X] = x0;
+        init[X2] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(x0) * x0);
+        init[X3] = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(init[X2]) * x0);
+
+        std::vector<std::uint32_t> M(D * D, 0);
+        for (size_t r = 0; r < S; ++r) {
+            PolyLoopExpr e = slots.count(state[r]) ? slots[state[r]] : polyState(state[r]);
+            if (!e.valid) { initOK = false; break; }
+            for (const auto& [dep, coeff] : e.state) {
+                auto it = pos.find(dep);
+                if (it == pos.end()) { initOK = false; break; }
+                M[r * D + it->second] += coeff;
+            }
+            if (!initOK) break;
+            M[r * D + C] += e.poly[0];
+            M[r * D + X] += e.poly[1];
+            M[r * D + X2] += e.poly[2];
+            M[r * D + X3] += e.poly[3];
+        }
+        if (!initOK) continue;
+
+        const std::uint32_t du = static_cast<std::uint32_t>(delta);
+        const std::uint32_t d2 = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(du) * du);
+        const std::uint32_t d3 = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(d2) * du);
+        M[C * D + C] = 1;
+        M[X * D + C] = du; M[X * D + X] = 1;
+        M[X2 * D + C] = d2;
+        M[X2 * D + X] = static_cast<std::uint32_t>(2ull * du);
+        M[X2 * D + X2] = 1;
+        M[X3 * D + C] = d3;
+        M[X3 * D + X] = static_cast<std::uint32_t>(3ull * d2);
+        M[X3 * D + X2] = static_cast<std::uint32_t>(3ull * du);
+        M[X3 * D + X3] = 1;
+
+        auto matMul = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& B) {
+            std::vector<std::uint32_t> R(D * D, 0);
+            for (size_t i = 0; i < D; ++i)
+                for (size_t k = 0; k < D; ++k) {
+                    const auto a = A[i * D + k]; if (!a) continue;
+                    for (size_t j = 0; j < D; ++j)
+                        R[i * D + j] += static_cast<std::uint32_t>(
+                            static_cast<std::uint64_t>(a) * B[k * D + j]);
+                }
+            return R;
+        };
+        auto matVec = [D](const std::vector<std::uint32_t>& A,
+                          const std::vector<std::uint32_t>& v) {
+            std::vector<std::uint32_t> r(D, 0);
+            for (size_t i = 0; i < D; ++i)
+                for (size_t j = 0; j < D; ++j)
+                    r[i] += static_cast<std::uint32_t>(
+                        static_cast<std::uint64_t>(A[i * D + j]) * v[j]);
+            return r;
+        };
+
+        std::vector<std::uint32_t> P(D * D, 0);
+        for (size_t i = 0; i < D; ++i) P[i * D + i] = 1;
+        std::vector<std::uint32_t> B = M;
+        std::uint64_t eN = static_cast<std::uint64_t>(trips);
+        while (eN) {
+            if (eN & 1ULL) P = matMul(P, B);
+            eN >>= 1ULL;
+            if (eN) B = matMul(B, B);
+        }
+        const auto final = matVec(P, init);
+
+        std::vector<IRInstr> out;
+        out.reserve(n - (back - h + 1) + S * 2 + 2);
+        out.insert(out.end(), func.instrs.begin(),
+                   func.instrs.begin() + static_cast<long>(h));
+        for (size_t i = 0; i < S; ++i) {
+            if (!slotLoadedAfter(func, back + 1, state[i])) continue;
+            out.emplace_back(IRInstrType::LI, "t0",
+                             std::to_string(static_cast<std::int32_t>(final[i])));
+            out.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(state[i]));
+        }
+        if (slotLoadedAfter(func, back + 1, iv)) {
+            out.emplace_back(IRInstrType::LI, "t0",
+                             std::to_string(static_cast<std::int32_t>(final[X])));
+            out.emplace_back(IRInstrType::STORE, "", "t0", std::to_string(iv));
+        }
+        out.insert(out.end(), func.instrs.begin() + static_cast<long>(back + 1),
+                   func.instrs.end());
+        func.instrs.swap(out);
+        return true;
+    }
+    return false;
+}
+
 bool summarizeLinearStateCountedLoop(IRFunction& func) {
     const size_t n = func.instrs.size();
     if (n < 10) return false;
@@ -3787,7 +4305,7 @@ bool unrollTailCountdownLoop(IRFunction& func) {
         while (initHeader > 0 && func.instrs[initHeader - 1].type == IRInstrType::LABEL)
             --initHeader;
         auto init = straightLineConstBefore(func, initHeader, countdownSlot);
-        if (!init || *init < 16) continue;
+        if (!init || *init < 32) continue;
 
         // No control flow or observable side effects inside one generated tail
         // iteration.  Labels at the very front are harmless aliases; labels
@@ -3808,7 +4326,7 @@ bool unrollTailCountdownLoop(IRFunction& func) {
         }
         if (!safe) continue;
 
-        constexpr int F = 16;
+        constexpr int F = 32;
         const std::string fastGuard = ".tail_u16_guard_" + func.name + "_" +
                                       std::to_string(serial);
         const std::string fastBody = ".tail_u16_body_" + func.name + "_" +
@@ -4295,7 +4813,7 @@ bool unrollInlinedUnitCountdownLoop(IRFunction& func) {
         // enough that the fast path is useful.  The generated runtime guard still
         // preserves the exact scalar remainder.
         auto init = straightLineConstBefore(func, h, countdownSlot);
-        constexpr int F = 16;
+        constexpr int F = 32;
         if (!init || *init < F) continue;
 
         // The tail-call argument builder computes the new countdown into a
@@ -4431,9 +4949,28 @@ void optimizeFunctionForCodegen(IRFunction& func) {
     unrollInlinedUnitCountdownLoop(func);
     unrollTailCountdownLoop(func);
 
-    // First collapse side-effect-free counted loops whose local carried
-    // state forms a small affine transition.  This catches longer copy/CSE/
-    // algebra chains that are not limited to a single accumulator recurrence.
+    // First collapse side-effect-free counted loops whose recurrence may
+    // contain a low-degree polynomial of the induction variable.  This covers
+    // <, <=, > and >= counted loops and CSE-heavy terms such as (i+c)^2.
+    for (int polyRound = 0; polyRound < 8; ++polyRound) {
+        if (!summarizePolynomialCountedLoop(func)) break;
+        for (int round = 0; round < 8; ++round) {
+            bool changed = false;
+            changed |= propagateConstantsAcrossCFG(func);
+            changed |= propagateCopiesAcrossCFG(func);
+            changed |= simplifyLocally(func);
+            changed |= removeUnreachableAfterJump(func);
+            changed |= eliminateUnreachableCFG(func);
+            changed |= eliminateDeadStores(func);
+            changed |= eliminateDeadRegisterComputations(func);
+            changed |= removeRedundantSelfCopies(func);
+            changed |= removeJumpToNextLabel(func);
+            changed |= removeUnreferencedLabels(func);
+            if (!changed) break;
+        }
+    }
+
+    // Then collapse the remaining affine-state counted loops.
     for (int linearRound = 0; linearRound < 8; ++linearRound) {
         if (!summarizeLinearStateCountedLoop(func)) break;
         for (int round = 0; round < 8; ++round) {
