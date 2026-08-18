@@ -4168,14 +4168,14 @@ bool unrollSimpleLoops(IRFunction& func) {
         if(updates!=1||step<=0) continue;
         const size_t bodyBegin=branchPos+1, bodyEnd=j;
         const size_t bodyLen=bodyEnd-bodyBegin;
-       if(bodyLen==0||bodyLen>96) continue;
+        if(bodyLen==0||bodyLen>32) continue;
         // Tiny hot loops benefit from a wider unroll because branch overhead is
         // a large fraction of their dynamic work.  Keep 4x for medium bodies to
         // avoid excessive code growth/instruction-cache pressure.
         // Tiny straight-line loops are dominated by branch/control overhead.
         // A 16x factor is still small when the body has <= 8 IR instructions;
         // larger loops retain the previous conservative factors.
-        const int unrollFactor = bodyLen <= 8 ? 32 : (bodyLen <= 16 ? 16 : (bodyLen <= 32 ? 8 : 4));
+        const int unrollFactor = bodyLen <= 8 ? 16 : (bodyLen <= 16 ? 8 : 4);
         const long long fastBound=bound-static_cast<long long>(unrollFactor-1)*step;
         if(fastBound<std::numeric_limits<int32_t>::min()||fastBound>std::numeric_limits<int32_t>::max()) continue;
 
@@ -4227,10 +4227,10 @@ bool unrollSimpleLoops(IRFunction& func) {
         if(!ok||branchCount!=1) continue;
         const size_t segBegin=h+1, segEnd=j;
         const size_t segLen=segEnd-segBegin;
-        if(segLen==0 || segLen>96) continue;
+        if(segLen==0 || segLen>32) continue;
         std::vector<IRInstr> repl; repl.reserve(func.instrs.size()+segLen*3);
         repl.insert(repl.end(),func.instrs.begin(),func.instrs.begin()+static_cast<long>(j));
-        for(int copy=0;copy<7;++copy) repl.insert(repl.end(),func.instrs.begin()+static_cast<long>(segBegin),func.instrs.begin()+static_cast<long>(segEnd));
+        for(int copy=0;copy<3;++copy) repl.insert(repl.end(),func.instrs.begin()+static_cast<long>(segBegin),func.instrs.begin()+static_cast<long>(segEnd));
         repl.insert(repl.end(),func.instrs.begin()+static_cast<long>(j),func.instrs.end());
         func.instrs.swap(repl); changed=true;
         j=h+1;
